@@ -20,13 +20,12 @@ import argparse
 import jax
 import numpy as np
 
+from disruption_eval import Greedy  # scripts/ is on sys.path when run
 from transit_bench import make
 from transit_bench.algos.imitate import warm_start
 from transit_bench.algos.ppo import PPOConfig, train
 from transit_bench.core.policy import make_rollout
 from transit_bench.envs.train.heuristic import RouteSetting, TerminateWhenStuck
-
-from disruption_eval import Greedy  # noqa: E402  (scripts/ is on sys.path when run)
 
 ENV = "train/response-v0"
 

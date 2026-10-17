@@ -7,9 +7,14 @@ timetable come from `infra.build`.
 Dynamics, in ticks of `step_seconds`:
 - A train occupies one block at a time and holds it until it enters the
   next (blocking). Entering a block takes its running time (nominal x the
-  block's speed factor x lognormal noise, plus any incident delay drawn
-  for this entry) plus the dwell if the train stops there, rounded up to
-  whole ticks.
+  block's speed factor x lognormal noise, plus any incident delay) plus
+  the dwell if the train stops there, rounded up to whole ticks.
+- The noise and incidents are drawn per train and route position at
+  reset (a `Trip`), not per tick: each train enters each block once, so
+  the distribution is the same, but the scenario no longer depends on
+  when a train enters a block. Every policy then faces the same scenario
+  given the seed (common random numbers), and the best schedule in
+  hindsight is well defined (`bound`).
 - A train is *ready* when its time in the current block is up (or, before
   its first block, from its scheduled departure). A ready train in its last
   block leaves the network. Otherwise, if its next block is free and open,
@@ -63,11 +68,16 @@ BLOCK_FIELDS = 6
 DELAY_SCALE = 600.0  # seconds: observation scale for delays and times
 
 
+class Trip(NamedTuple):
+    """Each train's random running times, drawn at reset."""
+
+    noise: np.ndarray  # (trains, L) float: running-time factor entering route[i, p]
+    incident: np.ndarray  # (trains, L) float: extra seconds then (mostly 0)
+
+
 class Exogenous(NamedTuple):
     """One step's random draws."""
 
-    noise: np.ndarray  # (trains,) float: running-time factor if the train enters a block
-    incident: np.ndarray  # (trains,) float: extra seconds if it does (mostly 0)
     onset: np.ndarray  # (blocks,) float: disruption onset draws (core.disruption)
     duration: np.ndarray  # (blocks,) float: outage seconds if one starts
 
@@ -89,10 +99,11 @@ class TrainSim:
 
     # -- state ---------------------------------------------------------------
 
-    def reset(self, seed=None):
+    def reset(self, seed=None, trip=None):
         if seed is not None:
             self.rng = np.random.default_rng(seed)
         T = len(self.infra.route)
+        self.trip = trip if trip is not None else self.draw_trip()
         self.t = 0
         self.pos = [NOT_STARTED] * T
         self.remaining = [0] * T
@@ -104,18 +115,21 @@ class TrainSim:
         self.potential = 0.0
         return self.observe()
 
-    def draw(self):
+    def draw_trip(self):
         c = self.config
-        T = len(self.infra.route)
+        shape = self.infra.route.shape
         if c.running_cv > 0:
             mu, sigma = lognormal_params(c.running_cv)
-            noise = self.rng.lognormal(mu, sigma, T)
+            noise = self.rng.lognormal(mu, sigma, shape)
         else:
-            noise = np.ones(T)
-        hit = self.rng.random(T) < c.incident_probability
-        incident = np.where(hit, self.rng.exponential(c.incident_seconds, T), 0.0)
-        d = disruption.draw_np(c.disruption, self.rng, self.infra.n_blocks)
-        return Exogenous(noise, incident, d.onset, d.duration)
+            noise = np.ones(shape)
+        hit = self.rng.random(shape) < c.incident_probability
+        incident = np.where(hit, self.rng.exponential(c.incident_seconds, shape), 0.0)
+        return Trip(noise, incident)
+
+    def draw(self):
+        d = disruption.draw_np(self.config.disruption, self.rng, self.infra.n_blocks)
+        return Exogenous(d.onset, d.duration)
 
     # -- queries -------------------------------------------------------------
 
@@ -237,7 +251,8 @@ class TrainSim:
             self.occupant[b] = i
             claimed.add(b)
             p = self.pos[i]
-            seconds = infra.run[i][p] * self.block_speed[b] * exo.noise[i] + exo.incident[i]
+            noise, incident = self.trip.noise[i][p], self.trip.incident[i][p]
+            seconds = infra.run[i][p] * self.block_speed[b] * noise + incident
             ticks = max(1, math.ceil(seconds / c.step_seconds - 1e-9))
             self.remaining[i] = ticks + int(infra.dwell[i][p])
             info["entered"] += 1

@@ -18,6 +18,7 @@ from transit_bench.envs.train.sim import (
     WAIT,
     Exogenous,
     TrainSim,
+    Trip,
     first_come_first_served,
     route_setting,
     section_reservation,
@@ -32,10 +33,13 @@ def x64():
     jax.config.update("jax_enable_x64", False)
 
 
-def calm(config, n_trains):
-    """No noise, no incidents and no disruptions."""
-    n_blocks = build(config).n_blocks
-    return Exogenous(np.ones(n_trains), np.zeros(n_trains), np.ones(n_blocks), np.zeros(n_blocks))
+def calm(sim):
+    """No noise and no incidents on `sim`'s trip; returns a step's draws
+    without disruptions."""
+    shape = sim.infra.route.shape
+    sim.trip = Trip(np.ones(shape), np.zeros(shape))
+    n_blocks = sim.infra.n_blocks
+    return Exogenous(np.ones(n_blocks), np.zeros(n_blocks))
 
 
 # -- infrastructure ------------------------------------------------------------
@@ -89,8 +93,9 @@ def test_a_calm_train_runs_to_time():
     sim = TrainSim(c)
     T = len(sim.pos)
     done = False
+    exo = calm(sim)
     while not done:
-        _, _, terminated, truncated, info = sim.step([GO] * T, calm(c, T))
+        _, _, terminated, truncated, info = sim.step([GO] * T, exo)
         done = terminated or truncated
     assert terminated and info["finished"] == T
     assert sim.arrival_delay == [0.0] * T
@@ -101,13 +106,14 @@ def test_holding_a_train_makes_it_late_and_the_return_is_the_delay():
     sim = TrainSim(c)
     T = len(sim.pos)
     total, done, held = 0.0, False, 0
+    exo = calm(sim)
     while not done:
         # Hold train 0 for its first five decisions.
         actions = [GO] * T
         if sim.deciding(0) and held < 5:
             actions[0] = WAIT
             held += 1
-        _, reward, terminated, truncated, _ = sim.step(actions, calm(c, T))
+        _, reward, terminated, truncated, _ = sim.step(actions, exo)
         total += reward
         done = terminated or truncated
     step = c.step_seconds
@@ -150,13 +156,13 @@ def test_head_on_trains_on_single_track_deadlock_without_reservation():
 
 
 def test_closed_block_stops_trains():
-    c = replace(PRESETS["line"], trains_per_direction=1)
-    sim = TrainSim(c)
+    sim = TrainSim(replace(PRESETS["line"], trains_per_direction=1))
     first = int(sim.infra.route[0][1])
     sim.block_open[first] = False
     T = len(sim.pos)
+    exo = calm(sim)
     for _ in range(30):
-        sim.step([GO] * T, calm(c, T))
+        sim.step([GO] * T, exo)
     assert sim.pos[0] == 0
 
 
@@ -187,7 +193,7 @@ def replay(preset, policy, seed):
     sim = TrainSim(preset)
     env = TrainEnv(preset)
     obs = sim.reset(seed)
-    state, ts = env.reset(jax.random.key(0))
+    state, ts = env.reset(jax.random.key(0), sim.trip)
     np.testing.assert_array_equal(ts.observation, obs)
     step = jax.jit(env.step)
     deciding = jax.jit(env.deciding)
@@ -233,7 +239,7 @@ def test_jax_heuristics_match_python(preset):
     ]:
         sim = TrainSim(preset)
         sim.reset(3)
-        state, _ = env.reset(jax.random.key(0))
+        state, _ = env.reset(jax.random.key(0), sim.trip)
         act, step = jax.jit(policy.act), jax.jit(env.step)
         carry = policy.init()
         for t in range(env.max_steps):
@@ -279,9 +285,9 @@ def test_deadlock_detection_finds_exactly_the_cycle():
 @pytest.mark.usefixtures("x64")
 def test_draws_match_python_in_distribution():
     env = TrainEnv("line")
-    keys = jax.random.split(jax.random.key(0), 20_000)
-    exo = jax.jit(jax.vmap(env.draw))(keys)
-    noise, incident = np.asarray(exo.noise), np.asarray(exo.incident)
+    keys = jax.random.split(jax.random.key(0), 2_000)
+    trip = jax.jit(jax.vmap(env.draw_trip))(keys)
+    noise, incident = np.asarray(trip.noise), np.asarray(trip.incident)
     c = env.config
     assert noise.mean() == pytest.approx(1.0, abs=0.005)
     assert noise.std() == pytest.approx(c.running_cv, rel=0.05)
@@ -451,3 +457,13 @@ def test_a_train_held_by_a_closed_block_can_terminate_and_is_active():
     # The rule terminates it: 50 minutes of outage left outweighs 4 calls x 5 minutes.
     _, actions = env.heuristic().act(env.heuristic().init(), state)
     assert int(actions[0]) == TERMINATE
+
+
+def test_the_trip_is_the_same_whatever_the_policy():
+    """Common random numbers: a seed fixes each train's running times."""
+    env = TrainEnv("single")
+    a, _ = env.reset(jax.random.key(5))
+    b, _ = env.reset(jax.random.key(5))
+    np.testing.assert_array_equal(a.trip.noise, b.trip.noise)
+    assert a.trip.noise.shape == env.infra.route.shape
+    assert (np.asarray(a.trip.noise) != 1).all()

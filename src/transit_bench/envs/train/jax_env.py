@@ -1,7 +1,7 @@
 """The train env in JAX: the Python reference (`sim`) as pure array functions.
 
 Same dynamics, observation and reward as `sim.TrainSim`; given the same
-`Exogenous` draws (and jax_enable_x64) trajectories match exactly
+`Trip` and `Exogenous` draws (and jax_enable_x64) trajectories match exactly
 (tests/test_train.py). Trains act one after another in index order, through
 a loop over trains that is unrolled when traced; everything else is
 vectorised. Blocks carry a `core.network.EdgeState` (open, speed) in the
@@ -34,6 +34,7 @@ from transit_bench.envs.train.sim import (
     TERMINATE,
     WAIT,
     Exogenous,
+    Trip,
     lognormal_params,
 )
 
@@ -57,6 +58,7 @@ class TrainState(NamedTuple):
     blocks: EdgeState  # per block: open, speed factor
     disruption: disruption.DisruptionState  # per block: down, elapsed, remaining
     potential: jax.Array  # () float: total projected delay after the last step
+    trip: Trip  # (trains, L) each: running-time noise and incident seconds, from reset
     t: jax.Array  # () int
     key: jax.Array
 
@@ -122,9 +124,14 @@ class TrainEnv:
             jnp.asarray(infra.direction, jnp.int32),
         )
 
-    def initial_state(self, key):
+    def initial_state(self, key, trip=None):
+        """The state at t = 0; draws the `Trip` from `key` unless given."""
         f = self._float()
         T, B = self.n_trains, self.n_blocks
+        if trip is None:
+            key, sub = jax.random.split(key)
+            trip = self.draw_trip(sub)
+        trip = Trip(jnp.asarray(trip.noise, f), jnp.asarray(trip.incident, f))
         return TrainState(
             pos=jnp.full(T, NOT_STARTED, jnp.int32),
             remaining=jnp.zeros(T, jnp.int32),
@@ -133,6 +140,7 @@ class TrainEnv:
             blocks=EdgeState(open=jnp.ones(B, bool), speed=jnp.ones(B, f)),
             disruption=disruption.initial(B, f),
             potential=jnp.zeros((), f),
+            trip=trip,
             t=jnp.zeros((), jnp.int32),
             key=key,
         )
@@ -144,25 +152,30 @@ class TrainEnv:
             info[k] = v.astype(info[k].dtype)
         return info
 
-    def reset(self, key):
-        state = self.initial_state(key)
+    def reset(self, key, trip=None):
+        state = self.initial_state(key, trip)
         false = jnp.zeros((), bool)
         zero = jnp.zeros((), self._float())
         return state, TimeStep(self.observe(state), zero, false, false, self._info())
 
-    def draw(self, key):
-        """This step's `Exogenous` draws, as `sim.TrainSim.draw` in distribution."""
-        c, T, f = self.config, self.n_trains, self._float()
-        k_noise, k_hit, k_size, k_disrupt = jax.random.split(key, 4)
+    def draw_trip(self, key):
+        """The episode's `Trip`, as `sim.TrainSim.draw_trip` in distribution."""
+        c, f = self.config, self._float()
+        shape = self.infra.route.shape
+        k_noise, k_hit, k_size = jax.random.split(key, 3)
         if c.running_cv > 0:
             mu, sigma = lognormal_params(c.running_cv)
-            noise = jnp.exp(mu + sigma * jax.random.normal(k_noise, (T,), f))
+            noise = jnp.exp(mu + sigma * jax.random.normal(k_noise, shape, f))
         else:
-            noise = jnp.ones(T, f)
-        hit = jax.random.uniform(k_hit, (T,), f) < c.incident_probability
-        size = jax.random.exponential(k_size, (T,), f) * c.incident_seconds
-        d = disruption.draw(c.disruption, k_disrupt, self.n_blocks, f)
-        return Exogenous(noise, jnp.where(hit, size, 0.0), d.onset, d.duration)
+            noise = jnp.ones(shape, f)
+        hit = jax.random.uniform(k_hit, shape, f) < c.incident_probability
+        size = jax.random.exponential(k_size, shape, f) * c.incident_seconds
+        return Trip(noise, jnp.where(hit, size, 0.0))
+
+    def draw(self, key):
+        """This step's `Exogenous` draws, as `sim.TrainSim.draw` in distribution."""
+        d = disruption.draw(self.config.disruption, key, self.n_blocks, self._float())
+        return Exogenous(d.onset, d.duration)
 
     # -- queries -------------------------------------------------------------
 
@@ -262,8 +275,6 @@ class TrainEnv:
             key, sub = jax.random.split(state.key)
             state = state._replace(key=key)
             exo = self.draw(sub)
-        noise = jnp.asarray(exo.noise, f)
-        incident = jnp.asarray(exo.incident, f)
         if self.shield:
             actions = jnp.where(self.vetoed(state), WAIT, actions)
         now = (state.t * c.step_seconds).astype(f)
@@ -297,7 +308,8 @@ class TrainEnv:
             occupant = occupant.at[jnp.where(enter, b, B)].set(i, mode="drop")
             claimed = claimed.at[jnp.where(enter, b, B)].set(True, mode="drop")
             new_p = jnp.clip(p + 1, 0, route.shape[1] - 1)
-            seconds = run[i, new_p] * state.blocks.speed[safe] * noise[i] + incident[i]
+            noise, incident = state.trip.noise[i, new_p], state.trip.incident[i, new_p]
+            seconds = run[i, new_p] * state.blocks.speed[safe] * noise + incident
             ticks = jnp.maximum(1, jnp.ceil(seconds / c.step_seconds - 1e-9).astype(jnp.int32))
             remaining = remaining.at[i].set(jnp.where(enter, ticks + dwell[i, new_p], remaining[i]))
             late = jnp.maximum(0.0, now - sched[i, route_len[i]])
