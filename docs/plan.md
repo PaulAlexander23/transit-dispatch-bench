@@ -162,10 +162,44 @@ its own state layout.
       all 6 presets × 3 option sets match exactly, both the Python reference
       (3 episodes, same NumPy seed) and the JAX env (same key, arrivals drawn
       on the device).
-- [ ] Port `CollectivePolicy`, JAX PPO + MAPPO and imitation.
-- [ ] Reproduce the reference numbers on `full` (heuristic 69; PPO ≥ 70
+- [x] Port `CollectivePolicy`, JAX PPO + MAPPO and imitation.
+      Collective control is also written in JAX on the env state
+      (`CollectiveControl`), tested action for action against the Python
+      one, so imitation data is collected in one jitted rollout (16 s for
+      100k samples, against about a minute on the Python env before).
+- [x] Reproduce the reference numbers on `full` (heuristic 69; PPO ≥ 70
       after warm start is enough to call the port good; a full 50M-step
       run only with the user's go-ahead).
+
+**Result.** Ported, with exact parity, and a bug found in the old envs.
+
+- **A float32 bug in the old JAX/Warp envs.** On `full` the JAX heuristic
+  delivered 62.3 ± 0.1 per episode against the Python reference's
+  67.0 ± 0.4. In float64 JAX gave 67.0, so I compared float32 trajectories
+  against Python step by step. They split at the first door cycle: a 4 s
+  door timer counted down in forty 0.1 s substeps keeps 1.6e-6 s in
+  float32 (0.1 is not exact in binary), so doors stayed open one extra step
+  and every stop took 5 steps instead of 4. Fixed by snapping the timer to
+  zero within a thousandth of a substep (`sim._count_down`). That changes
+  nothing in float64, so the old-repo parity still holds there. Now float32
+  follows Python step for step under the heuristic (regression test
+  `test_float32_env_follows_python_under_the_heuristic`). Lesson: the
+  old repo's "float32 drifts but stays statistically the same" was never
+  tested statistically. A systematic bias hid behind it, and it made the
+  old PPO numbers (77 at 50M steps, trained and evaluated in float32) look
+  better against the heuristic (69, measured in float64) than they were.
+- **Reference numbers, fixed env** (`scripts/reproduce_elevator.py`,
+  GTX 1080). Random 6.2 ± 0.1, collective control 67.0 ± 0.1 (1,024
+  episodes each). PPO with the old tuned settings (1,024 envs × 8 steps,
+  minibatch 2,048, 10 epochs, lr 5.2e-5, 256 × 256) after imitating 100k
+  heuristic samples: **80.6 ± 1.4 after 10M steps** (seeds 80.2, 82.5,
+  79.1; 2 minutes each at 83k steps/s), so 20% above the heuristic. With
+  the doors fixed the env is easier and PPO gets further in a fifth of the
+  steps. The old repo's 69 for the heuristic is not reproduced: the Python
+  reference gives 67.0 ± 0.4 over seeds 0–99 and JAX agrees, so 69 was
+  probably a small-sample estimate.
+- **Throughput.** JAX PPO at 83k steps/s on `full` with 1,024 envs; the
+  old repo's 363k was on the Warp env, which was left behind.
 
 ### Phase 2: bus loop
 
