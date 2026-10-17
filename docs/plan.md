@@ -31,19 +31,19 @@ normalised scores for every environment.
 
 Learning from [elevator-dispatching-rl](https://github.com/PaulAlexander23/elevator-dispatching-rl)
 (local: `~/Repositories/elevator-dispatching-rl`), a study in accelerating one
-elevator env. Source refs: `main` at `66f747b`, and the `next-plan` branch at
-`c4325a0` (draft PR #20), which alone has the multi-agent view and MAPPO.
+elevator env. Source ref: `main` at `206b740` (the merge of PR #20, which
+brought in the multi-agent view, MAPPO and the loop-free arrival draw).
 
 Port by copying and adapting, not by depending on that repo. Worth porting:
 
 | From | What | Notes |
 |---|---|---|
 | `building.py`, `building_env.py` | Python reference sim + Gymnasium env | Ground truth for parity tests |
-| `jax_env.py` | JAX env | Inverse-CDF Poisson arrivals into fixed slots (`next-plan` version) |
-| `jax_ppo.py` | JAX PPO + MAPPO (shared per-agent actor, central critic) | `next-plan` version |
+| `jax_env.py` | JAX env | Inverse-CDF Poisson arrivals into fixed slots |
+| `jax_ppo.py` | JAX PPO + MAPPO (shared per-agent actor, central critic) | |
 | `jax_imitate.py` | Imitation warm start from the heuristic | |
 | `baselines.py` | `CollectivePolicy` and random | |
-| `marl_env.py` | Multi-agent view in Mava's layout | `next-plan` only |
+| `marl_env.py` | Multi-agent view in Mava's layout | |
 | `conf/`, `tune*.py` | Hydra + Optuna tuning | Later, if needed |
 
 Leave behind: the C++, nanobind, ctypes, EnvPool and Warp ports. They were the
