@@ -42,13 +42,14 @@ from typing import NamedTuple
 
 import numpy as np
 
+from transit_bench.core import disruption
 from transit_bench.envs.train.infra import PRESETS, TrainConfig, build
 
 GO, WAIT = 0, 1
 NOT_STARTED = -1
 HEAD_FIELDS = 13
 LOOKAHEAD = 4  # blocks ahead on the route in each train's observation
-BLOCK_FIELDS = 4
+BLOCK_FIELDS = 6
 DELAY_SCALE = 600.0  # seconds: observation scale for delays and times
 
 
@@ -57,6 +58,8 @@ class Exogenous(NamedTuple):
 
     noise: np.ndarray  # (trains,) float: running-time factor if the train enters a block
     incident: np.ndarray  # (trains,) float: extra seconds if it does (mostly 0)
+    onset: np.ndarray  # (blocks,) float: disruption onset draws (core.disruption)
+    duration: np.ndarray  # (blocks,) float: outage seconds if one starts
 
 
 def lognormal_params(cv):
@@ -87,6 +90,7 @@ class TrainSim:
         self.occupant = [-1] * self.infra.n_blocks
         self.block_open = [True] * self.infra.n_blocks
         self.block_speed = [1.0] * self.infra.n_blocks
+        self.disruption = disruption.initial_np(self.infra.n_blocks)
         self.potential = 0.0
         return self.observe()
 
@@ -100,7 +104,8 @@ class TrainSim:
             noise = np.ones(T)
         hit = self.rng.random(T) < c.incident_probability
         incident = np.where(hit, self.rng.exponential(c.incident_seconds, T), 0.0)
-        return Exogenous(noise, incident)
+        d = disruption.draw_np(c.disruption, self.rng, self.infra.n_blocks)
+        return Exogenous(noise, incident, d.onset, d.duration)
 
     # -- queries -------------------------------------------------------------
 
@@ -197,6 +202,7 @@ class TrainSim:
         for i in range(T):
             if self.remaining[i] > 0:
                 self.remaining[i] -= 1
+        self._advance_disruption(exo, now)
         self.t += 1
         later = self.t * c.step_seconds
         total = sum(self.projected_delay(i, later) for i in range(len(self.pos)))
@@ -222,7 +228,10 @@ class TrainSim:
         it; one is deciding to enter it this tick ahead of this train in the
         acting order; one is deciding to enter it after.
         Then for each of the next LOOKAHEAD blocks on its route: on the
-        route, occupied, occupied by a train going the same way, open.
+        route, occupied, occupied by a train going the same way, open, time
+        since it went down and time until it comes back (over DELAY_SCALE,
+        capped at 1; the second is 0 unless the disruption config makes it
+        observable).
 
         The section fields expose the local conflict a single-track
         dispatcher must resolve: an oncoming train waiting at the far end of
@@ -268,10 +277,32 @@ class TrainSim:
                     j = self.occupant[b]
                     same = j >= 0 and infra.direction[j] == infra.direction[i]
                     ahead += [1.0, float(j >= 0), float(same), float(self.block_open[b])]
+                    ahead += self._outage(b)
                 else:
-                    ahead += [0.0, 0.0, 0.0, 0.0]
+                    ahead += [0.0] * BLOCK_FIELDS
             out.append(head + ahead)
         return np.array(out, dtype=np.float32).ravel()
+
+    def _outage(self, b):
+        d, c = self.disruption, self.config.disruption
+        if not d.down[b]:
+            return [0.0, 0.0]
+        left = min(d.remaining[b] / DELAY_SCALE, 1.0) if c.observe_remaining else 0.0
+        return [min(d.elapsed[b] / DELAY_SCALE, 1.0), left]
+
+    def _advance_disruption(self, exo, now):
+        """Blockages move on at the end of the tick, so the next decisions see
+        the state they will act under. Only section blocks can be disrupted."""
+        c = self.config.disruption
+        if c.mode == "none":
+            return
+        eligible = self.infra.section_of >= 0
+        draw = disruption.DisruptionDraw(exo.onset, exo.duration)
+        step = self.config.step_seconds
+        self.disruption = disruption.step_np(c, self.disruption, draw, eligible, now, step)
+        is_open, speed = disruption.edge_effect_np(c, self.disruption)
+        self.block_open = [bool(x) for x in is_open]
+        self.block_speed = [float(x) for x in speed]
 
     def _next_sections(self):
         """Per train, the next section it will enter from outside (-1 if none)."""

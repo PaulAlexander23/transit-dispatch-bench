@@ -30,8 +30,9 @@ def x64():
 
 
 def calm(config, n_trains):
-    """No noise and no incidents."""
-    return Exogenous(np.ones(n_trains), np.zeros(n_trains))
+    """No noise, no incidents and no disruptions."""
+    n_blocks = build(config).n_blocks
+    return Exogenous(np.ones(n_trains), np.zeros(n_trains), np.ones(n_blocks), np.zeros(n_blocks))
 
 
 # -- infrastructure ------------------------------------------------------------
@@ -301,7 +302,7 @@ def test_config_validation():
 
 
 def test_observation_shows_an_oncoming_rival_for_the_section():
-    from transit_bench.envs.train.sim import HEAD_FIELDS, LOOKAHEAD
+    from transit_bench.envs.train.sim import BLOCK_FIELDS, HEAD_FIELDS, LOOKAHEAD
 
     c = replace(
         PRESETS["single"],
@@ -314,7 +315,7 @@ def test_observation_shows_an_oncoming_rival_for_the_section():
     sim.step([GO, GO])  # both enter their terminal platforms
     while not (sim.deciding(0) and sim.deciding(1)):
         sim.step([WAIT, WAIT])
-    width = HEAD_FIELDS + 4 * LOOKAHEAD
+    width = HEAD_FIELDS + BLOCK_FIELDS * LOOKAHEAD
     obs = sim.observe().reshape(2, width)
     entering, inside, before, after = obs[:, 9], obs[:, 10], obs[:, 11], obs[:, 12]
     assert list(entering) == [1, 1]

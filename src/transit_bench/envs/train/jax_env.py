@@ -20,6 +20,7 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 
+from transit_bench.core import disruption
 from transit_bench.core.network import EdgeState
 from transit_bench.core.types import TimeStep
 from transit_bench.envs.train.infra import PRESETS, TrainConfig, build
@@ -44,6 +45,7 @@ class TrainState(NamedTuple):
     arrival_delay: jax.Array  # (trains,) float: seconds late at the end, once arrived
     occupant: jax.Array  # (blocks,) int: the train holding each block, or -1
     blocks: EdgeState  # per block: open, speed factor
+    disruption: disruption.DisruptionState  # per block: down, elapsed, remaining
     potential: jax.Array  # () float: total projected delay after the last step
     t: jax.Array  # () int
     key: jax.Array
@@ -107,6 +109,7 @@ class TrainEnv:
             arrival_delay=jnp.zeros(T, f),
             occupant=jnp.full(B, -1, jnp.int32),
             blocks=EdgeState(open=jnp.ones(B, bool), speed=jnp.ones(B, f)),
+            disruption=disruption.initial(B, f),
             potential=jnp.zeros((), f),
             t=jnp.zeros((), jnp.int32),
             key=key,
@@ -128,7 +131,7 @@ class TrainEnv:
     def draw(self, key):
         """This step's `Exogenous` draws, as `sim.TrainSim.draw` in distribution."""
         c, T, f = self.config, self.n_trains, self._float()
-        k_noise, k_hit, k_size = jax.random.split(key, 3)
+        k_noise, k_hit, k_size, k_disrupt = jax.random.split(key, 4)
         if c.running_cv > 0:
             mu, sigma = lognormal_params(c.running_cv)
             noise = jnp.exp(mu + sigma * jax.random.normal(k_noise, (T,), f))
@@ -136,7 +139,8 @@ class TrainEnv:
             noise = jnp.ones(T, f)
         hit = jax.random.uniform(k_hit, (T,), f) < c.incident_probability
         size = jax.random.exponential(k_size, (T,), f) * c.incident_seconds
-        return Exogenous(noise, jnp.where(hit, size, 0.0))
+        d = disruption.draw(c.disruption, k_disrupt, self.n_blocks, f)
+        return Exogenous(noise, jnp.where(hit, size, 0.0), d.onset, d.duration)
 
     # -- queries -------------------------------------------------------------
 
@@ -246,6 +250,7 @@ class TrainEnv:
             occupant=occupant,
             t=state.t + 1,
         )
+        state = self._advance_disruption(state, exo, now)
         later = (state.t * c.step_seconds).astype(f)
         total = self.projected_delay(state, later).sum()
         reward = -(total - state.potential) / 60
@@ -260,6 +265,17 @@ class TrainEnv:
         terminated = finished == self.n_trains
         truncated = state.t >= self.max_steps
         return state, TimeStep(self.observe(state), reward, terminated, truncated, info)
+
+    def _advance_disruption(self, state, exo, now):
+        """As sim.TrainSim._advance_disruption: at the end of the tick."""
+        c = self.config.disruption
+        if c.mode == "none":
+            return state
+        eligible = jnp.asarray(self.infra.section_of >= 0)
+        draw = disruption.DisruptionDraw(exo.onset, exo.duration)
+        d = disruption.step(c, state.disruption, draw, eligible, now, self.config.step_seconds)
+        is_open, speed = disruption.edge_effect(c, d)
+        return state._replace(disruption=d, blocks=EdgeState(open=is_open, speed=speed))
 
     # -- observation ---------------------------------------------------------
 
@@ -335,7 +351,14 @@ class TrainEnv:
         occupied = on_route & (j >= 0)
         same = occupied & (direction[jnp.maximum(j, 0)] == direction[:, None])
         is_open = on_route & state.blocks.open[b]
-        ahead = jnp.stack([on_route, occupied, same, is_open], axis=2).astype(jnp.float32)
+        d = state.disruption
+        down = on_route & d.down[b]
+        elapsed = jnp.where(down, jnp.minimum(d.elapsed[b] / DELAY_SCALE, 1.0), 0.0)
+        left = jnp.minimum(d.remaining[b] / DELAY_SCALE, 1.0)
+        left = jnp.where(down & self.config.disruption.observe_remaining, left, 0.0)
+        ahead = jnp.stack([on_route, occupied, same, is_open, elapsed, left], axis=2).astype(
+            jnp.float32
+        )
         return jnp.concatenate([head, ahead.reshape(self.n_trains, -1)], axis=1).ravel()
 
 

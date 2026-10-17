@@ -28,6 +28,8 @@ from typing import NamedTuple
 
 import numpy as np
 
+from transit_bench.core.disruption import DisruptionConfig
+
 EAST, WEST = 0, 1
 
 
@@ -55,6 +57,8 @@ class TrainConfig:
     running_cv: float = 0.1
     incident_probability: float = 0.02
     incident_seconds: float = 120.0
+    # Blockages of section blocks (see core.disruption); none by default.
+    disruption: DisruptionConfig = DisruptionConfig()
 
     def __post_init__(self):
         if self.n_stations < 2 or self.blocks_per_section < 1:
@@ -72,6 +76,12 @@ PRESETS = {"line": TrainConfig()}
 PRESETS["passing"] = replace(PRESETS["line"], passing_loops=True, express_every=3)
 PRESETS["single"] = replace(
     PRESETS["line"], single_track=True, trains_per_direction=4, headway=600.0, west_offset=0.0
+)
+# Section blocks close at random: about 0.8 outages an episode over the 8
+# section blocks, lasting 10 minutes on average (exponential, memoryless).
+PRESETS["blockage"] = replace(
+    PRESETS["single"],
+    disruption=DisruptionConfig(mode="markov", rate_per_hour=0.1, mean_seconds=600.0),
 )
 
 
