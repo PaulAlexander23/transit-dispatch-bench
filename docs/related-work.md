@@ -38,6 +38,12 @@ claiming there is none.
   noncompact MILP stronger than big-M (Oper. Res. 2019,
   [summary](https://academicnewsletter.sufe.edu.cn/info/382914)); see the
   [SINTEF/Gurobi webinar](https://cdn.gurobi.com/wp-content/uploads/SINTEF_Webinar.pdf?x85428).
+- **Safe multi-agent RL on Flatland.** Contract-based compositional
+  shielding ([arXiv 2606.14130](https://arxiv.org/abs/2606.14130)): a
+  shield vetoes unsafe joint actions so exploration cannot cause
+  collisions or deadlocks; it treats single-track Flatland as
+  deterministic once generated. The suite's `shield` option on the train
+  env is the simplest version of this idea.
 - **RL for rescheduling.** Yue et al. ([arXiv 2401.06952](https://arxiv.org/abs/2401.06952),
   T-ITS 2024): timetable as a directed graph, GNN state, curriculum over delay
   levels plus local search. Agasucci et al.

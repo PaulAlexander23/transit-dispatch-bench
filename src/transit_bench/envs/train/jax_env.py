@@ -57,14 +57,22 @@ class TrainEnv:
     `n_agents` trains each choose GO (0) or WAIT (1); only deciding trains'
     choices take effect (`active_agents`). The observation is one block of
     features per train (`per_agent_obs`), as `sim.TrainSim.observe`.
+
+    With `shield=True` a safety shield vetoes any GO that route setting
+    (`heuristic.RouteSetting`) would not allow: the train waits instead, and
+    it does not count as active, since it had no choice. Exploration can
+    then never walk into the deadlocks route setting avoids, and "always
+    GO" under the shield is route setting itself. Without the shield the
+    env matches the Python reference step for step.
     """
 
-    def __init__(self, config=None, max_steps=360, reward_shaping=False):
+    def __init__(self, config=None, max_steps=360, reward_shaping=False, shield=False):
         if isinstance(config, str):
             config = PRESETS[config]
         self.config = c = config if config is not None else TrainConfig()
         # The reward is already dense (projected lateness); no shapings yet.
         self.reward_shaping = reward_shaping
+        self.shield = shield
         self.max_steps = max_steps
         self.infra = infra = build(c)
         self.n_trains = T = len(infra.route)
@@ -169,8 +177,18 @@ class TrainEnv:
         return self.ready(state) & (b >= 0) & free
 
     def active_agents(self, state):
-        """Trains whose action takes effect this step: the deciding ones."""
+        """Trains whose action takes effect this step: the deciding ones
+        (less those the shield holds)."""
+        if self.shield:
+            return self.deciding(state) & ~self.vetoed(state)
         return self.deciding(state)
+
+    def vetoed(self, state):
+        """(trains,) bool: deciding trains route setting would hold."""
+        from transit_bench.envs.train.heuristic import RouteSetting
+
+        _, rule = RouteSetting(self).act(jnp.zeros((), jnp.int32), state)
+        return self.deciding(state) & (rule == WAIT)
 
     def projected_delay(self, state, now):
         route, route_len, _, _, sched, _ = self._arrays()
@@ -209,6 +227,8 @@ class TrainEnv:
             exo = self.draw(sub)
         noise = jnp.asarray(exo.noise, f)
         incident = jnp.asarray(exo.incident, f)
+        if self.shield:
+            actions = jnp.where(self.vetoed(state), WAIT, actions)
         now = (state.t * c.step_seconds).astype(f)
         ready = self.ready(state)
         deciding = self.deciding(state)

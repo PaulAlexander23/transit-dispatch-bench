@@ -349,3 +349,17 @@ def test_route_setting_avoids_the_platform_cycle_deadlocks():
     route_dl, route_return = run(route_setting)
     assert reserve_dl > 0 and route_dl == 0
     assert route_return > reserve_return
+
+
+def test_shield_vetoes_unsafe_go_and_makes_always_go_route_setting():
+    env = TrainEnv("single", shield=True)
+    plain = TrainEnv("single")
+    rule = plain.heuristic()
+    always_go = FirstComeFirstServed(env)
+    for seed in range(3):
+        shielded, _ = jax.jit(make_rollout(env, always_go, 16, env.max_steps))(jax.random.key(seed))
+        reference, _ = jax.jit(make_rollout(plain, rule, 16, plain.max_steps))(jax.random.key(seed))
+        np.testing.assert_allclose(np.asarray(shielded), np.asarray(reference))
+    state, _ = env.reset(jax.random.key(0))
+    active = env.active_agents(state)
+    assert not (active & env.vetoed(state)).any()

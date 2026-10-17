@@ -9,8 +9,9 @@ episodes), deadlock rate and trains finished. Policies:
   rules);
 - a clone of route setting (the env's heuristic) trained on `single` only: the
   distribution-shift test (trained without blockages, tested with them);
-- the clone fine-tuned with MAPPO on `blockage` (in distribution), if
-  `--timesteps` > 0.
+- the clone fine-tuned with MAPPO on `blockage` (in distribution), and
+  MAPPO from scratch under the safety shield (`TrainEnv(shield=True)`,
+  which vetoes any GO route setting forbids), if `--timesteps` > 0.
 
     uv run python scripts/disruption_eval.py --timesteps 5000000
 """
@@ -63,6 +64,8 @@ def main():
     args = parser.parse_args()
     print(f"devices: {jax.devices()}")
     envs = {env_id: make(env_id) for env_id in ENVS}
+    for env_id, env in envs.items():
+        env.id = env_id
     config = PPOConfig(
         n_envs=512,
         n_steps=16,
@@ -84,12 +87,28 @@ def main():
             ENVS[1], args.timesteps, config, seed=args.seed, params=clone, verbose=False
         )
         policies["clone + mappo (blockage)"] = lambda env: Greedy(env, tuned)
+        shielded, _ = train(
+            ENVS[1],
+            args.timesteps,
+            config._replace(learning_rate=3e-4),
+            env_kwargs={"shield": True},
+            seed=args.seed,
+            verbose=False,
+        )
+        shielded_envs = {env_id: make(env_id, shield=True) for env_id in ENVS}
+        # Runs on the shielded env: the shield is part of this policy.
+        policies["shielded mappo (blockage)"] = lambda env: (
+            shielded_envs[env.id],
+            Greedy(shielded_envs[env.id], shielded),
+        )
     print(f"{'policy':>26} | " + " | ".join(f"{e.split('/')[1]:^34}" for e in ENVS))
     print(f"{'':>26} | " + " | ".join(f"{'delay  cvar10  deadlk  finish':^34}" for _ in ENVS))
     for name, build in policies.items():
         cells = []
         for env in envs.values():
-            m = evaluate(env, build(env), args.episodes)
+            built = build(env)
+            run_env, pol = built if isinstance(built, tuple) else (env, built)
+            m = evaluate(run_env, pol, args.episodes)
             row = (m["delay"], m["cvar10"], m["deadlocks"], m["finished"])
             cells.append("{:5.2f}  {:6.2f}  {:6.3f}  {:6.3f}".format(*row))
         print(f"{name:>26} | " + " | ".join(f"{c:^34}" for c in cells), flush=True)
