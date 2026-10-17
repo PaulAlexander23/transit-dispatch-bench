@@ -134,6 +134,16 @@ vehicles to waiting requests is a bipartite matching (Hungarian algorithm or
 an LP), which is a much stronger baseline than nearest idle vehicle. RL earns
 its keep on **repositioning** idle vehicles ahead of demand.
 
+The env's matching rule solves that assignment exactly with Bertsekas'
+auction algorithm: each unassigned vehicle bids for the request with the
+best value (benefit minus price), raising its price by the margin over the
+second best plus ε; with integer costs and ε below 1/n the final assignment
+is optimal. It runs in JAX as a `while_loop` of vectorised bidding rounds
+(a Hungarian solver's augmenting paths do not vectorise), and in integers
+(benefits scaled by n + 1, ε = 1) so it matches the Python reference
+exactly. Dummy "stay" objects, dearer than any pickup, make it serve as
+many requests as it can before minimising distance.
+
 ## Disruptions as a stochastic process
 
 Each edge has a state `z_e ∈ {up, down}`.

@@ -53,6 +53,11 @@ def baselines(env_id, env):
         out["section reservation"] = SectionReservation(env)
         if env.n_actions > 2 or env.infra.express.any():  # the heuristic adds to it
             out["route setting"] = RouteSetting(env)
+    if family == "fleet":
+        from transit_bench.envs.fleet.heuristic import Matching, NearestIdle
+
+        out["nearest idle"] = NearestIdle(env)
+        out["matching"] = Matching(env)
     out["heuristic"] = env.heuristic()
     return out
 
@@ -88,6 +93,15 @@ def domain_metrics(env_id, env, rewards, info):
         if penalty:
             out.append(("terminated/ep", f"{info['terminated'].sum(axis=0).mean():.2f}"))
         return out
+    if family == "fleet":
+        picked = info["picked_up"].sum(axis=0)
+        lost = info["abandoned"].sum(axis=0) + info["rejected"].sum(axis=0)
+        wait = info["wait_ticks"].sum() * env.config.step_seconds / max(picked.sum(), 1)
+        return [
+            ("served/ep", f"{picked.mean():.1f}"),
+            ("lost", f"{lost.sum() / max(picked.sum() + lost.sum(), 1):.3f}"),
+            ("mean wait", f"{wait / 60:.1f} min"),
+        ]
     return []
 
 

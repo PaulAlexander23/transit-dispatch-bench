@@ -11,6 +11,7 @@ heuristic, and a normalised score (random = 0, heuristic = 1).
 | `elevator/*` | Line of floors | Move or serve, per lift | Collective control |
 | `bus/*` | Loop of stops | Go or hold, per deciding bus | Headway-based holding |
 | `train/*` | Blocks of track, double or single | Go or wait (or terminate, or divert), per deciding train | Route setting, giving way to expresses, rerouting |
+| `fleet/*` | Grid of nodes | Stay, move, or take a waiting request, per idle vehicle | Per-tick matching (exact auction) with rebalancing |
 
 Disruptions (blocked or slowed edges; Markov, semi-Markov or scripted) are a
 core process (as are vehicle breakdowns, on `bus/breakdown-v0` and

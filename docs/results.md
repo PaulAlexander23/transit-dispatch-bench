@@ -40,6 +40,18 @@ Baselines over 512 episodes each (seed 0). Score: random = 0, the env's heuristi
 | `elevator/outage-v0` | heuristic | 65.8 ± 0.2 | 1.00 | delivered/ep 65.8 |
 | `elevator/tall-v0` | random | 4.0 ± 0.1 | 0.00 | delivered/ep 4.0 |
 | `elevator/tall-v0` | heuristic | 58.3 ± 0.2 | 1.00 | delivered/ep 58.3 |
+| `fleet/city-v0` | random | -3504.3 ± 11.9 | 0.00 | served/ep 146.3, lost 0.473, mean wait 7.5 min |
+| `fleet/city-v0` | nearest idle | -3005.0 ± 16.8 | 0.28 | served/ep 214.4, lost 0.222, mean wait 8.6 min |
+| `fleet/city-v0` | matching | -1757.5 ± 9.9 | 0.97 | served/ep 242.5, lost 0.136, mean wait 4.3 min |
+| `fleet/city-v0` | heuristic | -1709.3 ± 10.6 | 1.00 | served/ep 243.8, lost 0.131, mean wait 4.2 min |
+| `fleet/commute-v0` | random | -1247.5 ± 6.6 | 0.00 | served/ep 67.6, lost 0.419, mean wait 5.3 min |
+| `fleet/commute-v0` | nearest idle | -516.6 ± 7.0 | 0.80 | served/ep 112.7, lost 0.040, mean wait 3.8 min |
+| `fleet/commute-v0` | matching | -391.4 ± 4.1 | 0.93 | served/ep 113.4, lost 0.039, mean wait 2.7 min |
+| `fleet/commute-v0` | heuristic | -330.5 ± 4.2 | 1.00 | served/ep 114.5, lost 0.031, mean wait 2.3 min |
+| `fleet/grid-v0` | random | -1216.4 ± 6.4 | 0.00 | served/ep 69.0, lost 0.407, mean wait 5.1 min |
+| `fleet/grid-v0` | nearest idle | -394.8 ± 6.1 | 0.88 | served/ep 115.3, lost 0.022, mean wait 3.0 min |
+| `fleet/grid-v0` | matching | -293.2 ± 3.5 | 0.99 | served/ep 115.9, lost 0.021, mean wait 2.1 min |
+| `fleet/grid-v0` | heuristic | -285.5 ± 3.4 | 1.00 | served/ep 116.0, lost 0.020, mean wait 2.1 min |
 | `train/blockage-v0` | random | -105.0 ± 4.1 | 0.00 | delay/train 13.13 min, CVaR10 35.80 min, deadlocks 0.525 |
 | `train/blockage-v0` | first come first served | -68.2 ± 4.1 | 0.45 | delay/train 8.53 min, CVaR10 34.25 min, deadlocks 0.373 |
 | `train/blockage-v0` | section reservation | -34.3 ± 2.9 | 0.87 | delay/train 4.29 min, CVaR10 26.66 min, deadlocks 0.109 |

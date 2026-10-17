@@ -491,8 +491,9 @@ optimal and copies section reservation, but does not yet improve on it.
 - [x] Core disruption process: edge outages (`κ_e = 0`), slow running
       (`σ_e > 1`), vehicle failures, demand surges. Markov, semi-Markov
       (lognormal durations, elapsed time observed) and scripted modes.
-      Done for edge outages and slow running (`core/disruption.py`);
-      vehicle failures and demand surges are still to do.
+      Done for edge outages and slow running (`core/disruption.py`), and
+      vehicle failures by running the same process over vehicles (bus
+      breakdowns, lift outages). Demand surges are still to do.
 - [x] Observation switch: remaining outage time visible or hidden.
 - [x] Train `blockage` preset with short-turn, cancel and reroute actions.
       Done: `blockage` (random closures on the single-track line) and
@@ -679,8 +680,65 @@ them so far is a better rule, not RL.
   or rarer, longer outages would weigh more.
 ### Phase 5: on-demand fleet
 
-- [ ] Env: grid graph, requests with OD, vehicle assignment + repositioning.
-- [ ] Heuristics: nearest idle vehicle; per-tick bipartite matching.
+- [x] Env: grid graph, requests with OD, vehicle assignment + repositioning.
+- [x] Heuristics: nearest idle vehicle; per-tick bipartite matching.
+
+**Result.** `envs/fleet/`: a Python reference and a JAX env that match step
+for step (all state is integer, so exactly), three presets, and three
+rules, the strongest a third better than nearest idle.
+
+- **Model.** Nodes of a G × G grid, one edge per tick (60 s), Manhattan
+  travel (x first, then y). Requests arrive as a Poisson process with an
+  origin and destination into a buffer of R slots (full: rejected), and
+  abandon after `patience` ticks (8) unless taken. Each vehicle carries
+  one request. An idle vehicle is the deciding agent: STAY, MOVE one node
+  (repositioning), or TAKE request slot r (5 + r actions in all); then it
+  drives itself to the pickup and on to the dropoff. Vehicles act in
+  index order, so a request two vehicles take goes to the earlier one.
+  Reward: minus waiting passenger-minutes, and 10 minutes per abandoned or
+  rejected request. Observation per vehicle: its position and job; per
+  request slot, the offset to the origin, pickup and trip distances and
+  time waited; per node, other idle vehicles and waiting requests.
+- **Action design.** "Take slot r" keeps the action space fixed (5 + R)
+  and lets every rule be written as a policy over it: nearest idle and
+  matching choose slots, repositioning chooses moves. The cost is that a
+  learner must learn which slot is which from the slot features; a
+  pointer-style policy over requests would be the natural next step.
+- **Matching, exactly, in integers.** The matching rule is a minimum-cost
+  assignment of idle vehicles to waiting requests (pickup distance), with
+  V + 1 dummy "stay" objects costing more than any distance so it serves
+  as many as it can. Solved by Bertsekas' auction algorithm: benefits
+  −cost × (n + 1) for n bidders and price increments of at least 1 make
+  it exactly optimal (tested against brute force on random instances),
+  and integer arithmetic makes the JAX `while_loop` version match the
+  Python one bit for bit. A Hungarian solver would not vectorise.
+- **Rebalancing.** Each vehicle gets a home, the origin-weight quantile
+  (v + ½)/V, and an idle vehicle that matching leaves alone heads home.
+  The env heuristic is matching + rebalancing.
+- **Presets and results** (harness, 512 episodes; return, lost share,
+  mean wait):
+
+  | Preset | Nearest idle | Matching | Matching + rebalancing |
+  |---|---|---|---|
+  | `grid` (5×5, 4 vehicles, 0.5/tick, uniform) | −395 / 2.2% / 3.0 min | −293 / 2.1% / 2.1 | **−286** / 2.0% / 2.1 |
+  | `commute` (trips west → east) | −517 / 4.0% / 3.8 | −391 / 3.9% / 2.7 | **−331** / 3.1% / 2.3 |
+  | `city` (8×8, 10 vehicles, 1.2/tick, commute) | −3005 / 22% / 8.6 | −1758 / 14% / 4.3 | **−1709** / 13% / 4.2 |
+
+- **What was learned.**
+  - Matching beats nearest idle by 25–40% on every preset, most on the
+    overloaded `city` (lost requests 22% → 14%). The likely cause (not
+    yet measured): serving the longest-waiting request first sends a
+    vehicle across the grid while requests next to it wait, and greedy
+    choices cannot be undone within the tick. This is the formulation's point that the per-tick
+    assignment is a much stronger baseline than nearest idle.
+  - Rebalancing matters where demand is asymmetric: 15% on `commute`
+    (vehicles end trips in the east and must come back empty), 3% on
+    `grid` and `city`. On `city` the fleet is too busy to rebalance: few
+    vehicles are ever idle with nothing to take.
+  - Where RL should look: anticipatory repositioning (going where
+    requests will appear, not where they started on average), and
+    holding a vehicle back from a far request for a likely near one,
+    which per-tick matching never does.
 
 ### Phase 6: benchmark harness
 
