@@ -56,6 +56,8 @@ class Bound(NamedTuple):
     cost: float  # minutes of total lateness: the lower bound (the dual bound if not optimal)
     optimal: bool
     seconds: float
+    entry: np.ndarray  # (trains, L) the best schedule's entry ticks (if one was found)
+    arrival: np.ndarray  # (trains,) its arrival ticks
 
 
 def scenarios(env, keys, n_steps=None):
@@ -158,7 +160,11 @@ def solve(env, scen, time_limit=30.0, horizon=None):
     info = h.getInfo()
     optimal = h.getModelStatus() == highspy.HighsModelStatus.kOptimal
     value = info.objective_function_value if optimal else info.mip_dual_bound
-    return Bound(float(value) / 60, bool(optimal), float(h.getRunTime()))
+    found = info.primal_solution_status == 2  # a feasible solution exists
+    values = np.asarray(h.getSolution().col_value) if found else np.full(T * L + T, np.nan)
+    entry = np.rint(values[: T * L]).reshape(T, L)  # x was added first, row by row
+    arrival = np.rint(values[T * L : T * L + T])
+    return Bound(float(value) / 60, bool(optimal), float(h.getRunTime()), entry, arrival)
 
 
 def run(env, policy, key, n_steps=None):

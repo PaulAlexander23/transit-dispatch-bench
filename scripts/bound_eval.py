@@ -20,6 +20,7 @@ from transit_bench.envs.train import TrainEnv
 from transit_bench.envs.train.bound import run, scenarios, solve
 from transit_bench.envs.train.heuristic import (
     FirstComeFirstServed,
+    GiveWayToExpress,
     RouteSetting,
     SectionReservation,
 )
@@ -51,6 +52,7 @@ def main():
             ("first come first served", FirstComeFirstServed(env)),
             ("section reservation", SectionReservation(env)),
             ("route setting", RouteSetting(env)),
+            ("give way to express", GiveWayToExpress(env)),
         ]:
             episode = jax.jit(jax.vmap(lambda k, env=env, policy=policy: run(env, policy, k)))
             cost, finished = map(np.asarray, episode(keys))

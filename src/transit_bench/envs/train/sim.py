@@ -498,3 +498,78 @@ def terminate_when_stuck(sim, rule=route_setting, factor=2.0):
     if options:
         actions[min(options)[1]] = TERMINATE
     return actions
+
+
+def give_way_to_express(sim, rule=route_setting):
+    """`rule`, plus: a stopping train on a loop platform lets an express pass.
+
+    A deciding stopping train i on a loop platform, about to enter the
+    section ahead, waits for an express j behind it on the same line if
+    the express would lose more by following it through the section than
+    i loses by waiting. In nominal ticks (no noise: the rule does not know
+    future running times), with q the index of the section's first block:
+
+    - ETA_j: until j enters block q, unimpeded;
+    - A_i, T_j: i's and j's times from q to the next station;
+    - j's loss if i goes now: max(0, A_i + D - (ETA_j + T_j)), since j
+      cannot reach the next station before i. D = 0 if i takes a loop
+      there (j passes it); otherwise (a terminus, or no loop) j must also
+      wait while i occupies the platform: D = i's time there + 1.
+    - i's wait if it gives way: ETA_j + j's time in block q + 1.
+
+    The D term is what matters on `passing`: the bound's schedules hold a
+    stopping train at the last loop before the terminus so the express
+    behind it does not wait out its dwell there.
+
+    Routes of trains going the same way have the same structure (station,
+    k section blocks, station, ...), so route indices compare across them.
+    The hindsight bound puts 28% of the delay on `passing` down to such
+    overtaking decisions, which no other rule makes.
+    """
+    actions = list(rule(sim))
+    infra, k = sim.infra, sim.config.blocks_per_section
+    cum = infra.cum_ticks
+    now = sim.t
+    T = len(sim.pos)
+    for i in range(T):
+        if actions[i] != GO or not sim.deciding(i) or infra.express[i] or sim.pos[i] < 0:
+            continue
+        p = sim.pos[i]
+        if not infra.loop_platform[sim.here(i)] or p + 1 + k >= infra.route_len[i]:
+            continue
+        q, nxt = p + 1, p + 1 + k
+        a_i = cum[i][nxt] - cum[i][q]
+        if not infra.loop_platform[int(infra.route[i][nxt])]:
+            a_i += cum[i][nxt + 1] - cum[i][nxt] + 1
+        for j in range(T):
+            behind = sim.pos[j] <= p and not sim.finished(j)  # <=: beside it, on the main line
+            if not (infra.express[j] and infra.direction[j] == infra.direction[i] and behind):
+                continue
+            if sim.pos[j] == NOT_STARTED:
+                depart = math.ceil(infra.sched[j][0] / sim.config.step_seconds - 1e-9)
+                base = max(0, depart - now)
+            else:
+                base = sim.remaining[j]
+            eta = base + cum[j][q] - cum[j][sim.pos[j] + 1]
+            t_j = cum[j][nxt] - cum[j][q]
+            loss = max(0, a_i - (eta + t_j))
+            wait = eta + (cum[j][q + 1] - cum[j][q]) + 1
+            if loss > wait:
+                actions[i] = WAIT
+                break
+    return actions
+
+
+def heuristic(sim):
+    """The env's heuristic (`TrainEnv.heuristic`): route setting, giving way
+    to expresses where there are any, and terminating when stuck where the
+    config allows it."""
+
+    def rule(sim):
+        if sim.infra.express.any():
+            return give_way_to_express(sim)
+        return route_setting(sim)
+
+    if sim.config.terminate_penalty > 0:
+        return terminate_when_stuck(sim, rule)
+    return rule(sim)

@@ -129,3 +129,62 @@ class TerminateWhenStuck:
         pick = jnp.argmin(score)
         actions = actions.at[pick].set(jnp.where(dead.any(), TERMINATE, actions[pick]))
         return carry, actions.astype(jnp.int32)
+
+
+class GiveWayToExpress:
+    """`rule` (route setting by default), plus: a stopping train on a loop
+    platform waits for an express behind it when the express would lose
+    more by following it through the next section (and, if there is no
+    loop at its end, waiting while it stands at the platform) than it
+    loses by waiting. `sim.give_way_to_express` in JAX, over all (train, express)
+    pairs at once."""
+
+    def __init__(self, env, rule=None):
+        self.env = env
+        self.rule = rule if rule is not None else RouteSetting(env)
+
+    def init(self):
+        return self.rule.init()
+
+    def act(self, carry, state, key=None):
+        carry, actions = self.rule.act(carry, state, key)
+        env, infra = self.env, self.env.infra
+        k, T = env.config.blocks_per_section, env.n_trains
+        cum = jnp.asarray(infra.cum_ticks, jnp.int32)
+        width = cum.shape[1]
+        L = width - 1
+        express = jnp.asarray(infra.express)
+        direction = jnp.asarray(infra.direction, jnp.int32)
+        route_len = jnp.asarray(infra.route_len, jnp.int32)
+        loop = jnp.asarray(infra.loop_platform)[jnp.maximum(env.here(state), 0)]
+        p = state.pos
+        rows = jnp.arange(T)
+        candidate = (
+            (actions == GO)
+            & env.deciding(state)
+            & ~express
+            & (p >= 0)
+            & loop
+            & (p + 1 + k < route_len)
+        )
+        q = jnp.clip(p + 1, 0, width - 1)
+        nxt = jnp.clip(p + 1 + k, 0, width - 1)
+        a_i = cum[rows, nxt] - cum[rows, q]  # (T,)
+        route = jnp.asarray(infra.route, jnp.int32)
+        next_loop = jnp.asarray(infra.loop_platform)[route[rows, jnp.minimum(nxt, L - 1)]]
+        a_i = a_i + jnp.where(next_loop, 0, cum[rows, jnp.minimum(nxt + 1, L)] - cum[rows, nxt] + 1)
+        # Pairs [i, j]: j an express behind i on the same line.
+        behind = (p[None, :] <= p[:, None]) & ~env.finished(state)[None, :]
+        pair = express[None, :] & (direction[None, :] == direction[:, None]) & behind
+        dt = env.config.step_seconds
+        depart = jnp.ceil(jnp.asarray(infra.sched[:, 0]) / dt - 1e-9).astype(jnp.int32)
+        base = jnp.where(p == NOT_STARTED, jnp.maximum(0, depart - state.t), state.remaining)
+        start = cum[rows, jnp.clip(p + 1, 0, width - 1)]  # (T,) j's next index
+        cum_q = cum[rows[None, :], q[:, None]]  # [i, j]: cum[j, q_i]
+        eta = base[None, :] + cum_q - start[None, :]
+        t_j = cum[rows[None, :], nxt[:, None]] - cum_q
+        loss = jnp.maximum(0, a_i[:, None] - (eta + t_j))
+        first = cum[rows[None, :], jnp.clip(q + 1, 0, width - 1)[:, None]] - cum_q
+        wait = eta + first + 1
+        give_way = candidate & (pair & (loss > wait)).any(axis=1)
+        return carry, jnp.where(give_way, WAIT, actions).astype(jnp.int32)

@@ -20,6 +20,8 @@ from transit_bench.envs.train.sim import (
     TrainSim,
     Trip,
     first_come_first_served,
+    give_way_to_express,
+    heuristic,
     route_setting,
     section_reservation,
     terminate_when_stuck,
@@ -225,15 +227,19 @@ def test_jax_matches_python_step_for_step(preset):
         replay(preset, lambda sim, rng: section_reservation(sim), seed)
         replay(preset, lambda sim, rng: route_setting(sim), seed)
         replay(preset, lambda sim, rng: terminate_when_stuck(sim), seed)
+        replay(preset, lambda sim, rng: heuristic(sim), seed)
 
 
 @pytest.mark.usefixtures("x64")
 @pytest.mark.parametrize("preset", PRESETS)
 def test_jax_heuristics_match_python(preset):
+    from transit_bench.envs.train.heuristic import GiveWayToExpress, RouteSetting
+
     env = TrainEnv(preset)
-    rule = terminate_when_stuck if env.n_actions == 3 else route_setting
     for policy, reference in [
-        (env.heuristic(), rule),
+        (env.heuristic(), heuristic),
+        (RouteSetting(env), route_setting),
+        (GiveWayToExpress(env), give_way_to_express),
         (SectionReservation(env), section_reservation),
         (FirstComeFirstServed(env), first_come_first_served),
     ]:
@@ -467,3 +473,21 @@ def test_the_trip_is_the_same_whatever_the_policy():
     np.testing.assert_array_equal(a.trip.noise, b.trip.noise)
     assert a.trip.noise.shape == env.infra.route.shape
     assert (np.asarray(a.trip.noise) != 1).all()
+
+
+def test_giving_way_to_the_express_reaches_the_bound_when_deterministic():
+    """On `passing` without noise or incidents, the hindsight-optimal
+    schedule holds a stopping train at the last loop before the terminus
+    for the express behind it; the rule makes exactly those holds."""
+    pytest.importorskip("highspy")
+    from transit_bench.envs.train.bound import run, scenario, solve
+    from transit_bench.envs.train.heuristic import GiveWayToExpress, RouteSetting
+
+    c = replace(PRESETS["passing"], running_cv=0.0, incident_probability=0.0)
+    env = TrainEnv(c, max_steps=720)
+    key = jax.random.key(0)
+    bound = solve(env, scenario(env, key)).cost
+    give_way, finished = run(env, GiveWayToExpress(env), key)
+    assert finished and float(give_way) == pytest.approx(bound, abs=1e-6)
+    route, _ = run(env, RouteSetting(env), key)
+    assert float(route) > bound + 5  # 12.2 vs 3.6 minutes of lateness in total

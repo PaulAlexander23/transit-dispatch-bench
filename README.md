@@ -10,7 +10,7 @@ heuristic, and a normalised score (random = 0, heuristic = 1).
 |---|---|---|---|
 | `elevator/*` | Line of floors | Move or serve, per lift | Collective control |
 | `bus/*` | Loop of stops | Go or hold, per deciding bus | Headway-based holding |
-| `train/*` | Blocks of track, double or single | Go or wait, per deciding train | Station-to-station route setting |
+| `train/*` | Blocks of track, double or single | Go or wait (or terminate), per deciding train | Route setting, giving way to expresses |
 
 Disruptions (blocked or slowed edges; Markov, semi-Markov or scripted) are a
 core process; `train/blockage-v0` switches them on, and `train/response-v0`

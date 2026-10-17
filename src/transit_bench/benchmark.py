@@ -51,7 +51,7 @@ def baselines(env_id, env):
 
         out["first come first served"] = FirstComeFirstServed(env)
         out["section reservation"] = SectionReservation(env)
-        if env.n_actions == 3:  # the heuristic adds TERMINATE to route setting
+        if env.n_actions == 3 or env.infra.express.any():  # the heuristic adds to it
             out["route setting"] = RouteSetting(env)
     out["heuristic"] = env.heuristic()
     return out

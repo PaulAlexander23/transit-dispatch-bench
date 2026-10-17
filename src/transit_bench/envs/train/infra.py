@@ -124,6 +124,12 @@ class Infra(NamedTuple):
     # A train terminated on the block at p misses calls_from[p + 1]; before
     # its departure, calls_from[0].
     calls_from: np.ndarray
+    # (trains, L + 1): nominal ticks (no noise or incidents) from entering
+    # route index 0 to entering index q; the difference of two entries is
+    # the nominal time between them.
+    cum_ticks: np.ndarray
+    # (blocks,) bool: a loop platform, where a following train can overtake
+    loop_platform: np.ndarray
 
 
 def build(config: TrainConfig) -> Infra:
@@ -220,6 +226,10 @@ def build(config: TrainConfig) -> Infra:
     section_shared = used.all(axis=1)
     calls = np.concatenate([dwell > 0, np.zeros((T, 1), bool)], axis=1)
     calls_from = np.cumsum(calls[:, ::-1], axis=1)[:, ::-1]
+    nominal = np.maximum(1, np.ceil(run / c.step_seconds - 1e-9)).astype(np.int64) + dwell
+    cum_ticks = np.concatenate([np.zeros((T, 1), np.int64), np.cumsum(nominal, axis=1)], axis=1)
+    loop_platform = np.zeros(n_blocks, bool)
+    loop_platform[[b for row in loop for b in row if b >= 0]] = True
     return Infra(
         n_blocks,
         station_of,
@@ -235,4 +245,6 @@ def build(config: TrainConfig) -> Infra:
         far_platform,
         section_shared,
         calls_from,
+        cum_ticks,
+        loop_platform,
     )

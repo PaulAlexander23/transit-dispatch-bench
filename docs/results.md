@@ -41,9 +41,10 @@ Baselines over 512 episodes each (seed 0). Score: random = 0, the env's heuristi
 | `train/line-v0` | section reservation | -10.9 ± 0.4 | 1.00 | delay/train 0.91 min, CVaR10 2.73 min, deadlocks 0.000 |
 | `train/line-v0` | heuristic | -10.9 ± 0.4 | 1.00 | delay/train 0.91 min, CVaR10 2.73 min, deadlocks 0.000 |
 | `train/passing-v0` | random | -52.2 ± 0.5 | 0.00 | delay/train 4.35 min, CVaR10 6.45 min, deadlocks 0.000 |
-| `train/passing-v0` | first come first served | -26.2 ± 0.4 | 1.00 | delay/train 2.19 min, CVaR10 4.00 min, deadlocks 0.000 |
-| `train/passing-v0` | section reservation | -26.2 ± 0.4 | 1.00 | delay/train 2.19 min, CVaR10 4.00 min, deadlocks 0.000 |
-| `train/passing-v0` | heuristic | -26.2 ± 0.4 | 1.00 | delay/train 2.19 min, CVaR10 4.00 min, deadlocks 0.000 |
+| `train/passing-v0` | first come first served | -26.2 ± 0.4 | 0.88 | delay/train 2.19 min, CVaR10 4.00 min, deadlocks 0.000 |
+| `train/passing-v0` | section reservation | -26.2 ± 0.4 | 0.88 | delay/train 2.19 min, CVaR10 4.00 min, deadlocks 0.000 |
+| `train/passing-v0` | route setting | -26.2 ± 0.4 | 0.88 | delay/train 2.19 min, CVaR10 4.00 min, deadlocks 0.000 |
+| `train/passing-v0` | heuristic | -22.8 ± 0.4 | 1.00 | delay/train 1.90 min, CVaR10 3.84 min, deadlocks 0.000 |
 | `train/response-v0` | random | -166.9 ± 0.7 | 0.00 | cost/train 20.86 min, CVaR10 24.07 min, deadlocks 0.006, terminated/ep 7.73 |
 | `train/response-v0` | first come first served | -76.8 ± 4.3 | 0.65 | cost/train 9.60 min, CVaR10 34.84 min, deadlocks 0.369, terminated/ep 0.00 |
 | `train/response-v0` | section reservation | -46.5 ± 3.3 | 0.87 | cost/train 5.81 min, CVaR10 30.30 min, deadlocks 0.129, terminated/ep 0.00 |

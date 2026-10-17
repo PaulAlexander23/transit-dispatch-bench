@@ -390,10 +390,37 @@ optimal and copies section reservation, but does not yet improve on it.
     captures any of it. It comes from overtaking: holding a stopping train
     in a loop so an express can pass. That is the next target for a
     better rule, a look-ahead planner and RL.
-  - The bound knows the future, so part of any gap is the value of
-    information, not achievable by any non-anticipative policy. A
-    stochastic look-ahead (sample scenarios, solve, act) would measure
-    how much.
+  - The bound knows the future, so part of any gap could be the value of
+    information, which no real-time policy can capture. Checked on
+    `passing` (100 scenarios): without incidents the gap is 39%, and fully
+    deterministic it is **70%** (route setting 1.01 vs 0.30 min per
+    train). So the gap is policy, not information.
+- **Rule: give way to the express** (`GiveWayToExpress`, now part of the
+  env heuristic where there are expresses). Found by reading the bound's
+  schedule on a deterministic scenario: the optimum holds a stopping train
+  at the *last loop before the terminus* for 8 ticks, because the
+  terminus has no loop and the express behind it would otherwise wait out
+  its dwell there (15 ticks). The rule: a stopping train on a loop
+  platform waits for an express behind it (or beside it on the main line)
+  when, in nominal ticks, the express's loss from following it (through
+  the section, plus the platform time if there is no loop at the end)
+  exceeds its own wait. Two bugs on the way, both found by the rule
+  never firing: pricing only the section (the gain is at the terminus),
+  and requiring the express to be strictly behind (it is usually on the
+  main platform of the same station when the stopping train decides).
+  **On deterministic `passing` it equals the bound exactly** (tested).
+  With noise and incidents (`scripts/bound_eval.py`, 200 scenarios):
+
+  | Policy on `passing` | Delay/train | Above bound |
+  |---|---|---|
+  | Route setting (= FCFS here) | 2.16 | 28% |
+  | **Give way to express** | **1.86** | **16%** |
+  | Hindsight bound | 1.56 | |
+
+  The remaining 16% is noise and incidents: the nominal-tick rule cannot
+  see a late express or a long dwell coming, and some of it is the value
+  of information. This is the headroom a learner or a stochastic
+  look-ahead could go after on `passing`.
 ### Phase 4: disruptions
 
 - [x] Core disruption process: edge outages (`κ_e = 0`), slow running

@@ -99,13 +99,21 @@ class TrainEnv:
         self.n_squarings = max(1, math.ceil(math.log2(T)))
 
     def heuristic(self):
-        """Route setting, the strongest of the rules (`heuristic`), plus
-        `TerminateWhenStuck` when the config allows TERMINATE."""
-        from transit_bench.envs.train.heuristic import RouteSetting, TerminateWhenStuck
+        """The strongest rules combined (`sim.heuristic`): route setting;
+        `GiveWayToExpress` where there are expresses; `TerminateWhenStuck`
+        where the config allows TERMINATE."""
+        from transit_bench.envs.train.heuristic import (
+            GiveWayToExpress,
+            RouteSetting,
+            TerminateWhenStuck,
+        )
 
+        rule = RouteSetting(self)
+        if self.infra.express.any():
+            rule = GiveWayToExpress(self, rule)
         if self.config.terminate_penalty > 0:
-            return TerminateWhenStuck(self)
-        return RouteSetting(self)
+            rule = TerminateWhenStuck(self, rule)
+        return rule
 
     # -- state ---------------------------------------------------------------
 
