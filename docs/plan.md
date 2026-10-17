@@ -156,8 +156,12 @@ its own state layout.
 - [x] Parity test: new JAX env against new Python reference, every preset.
       `tests/test_elevator_jax.py`: 5 presets × 5 option sets, 2 episodes
       each, exact observations in float64.
-- [ ] Parity test against the old repo's env (same seed, same trajectory),
+- [x] Parity test against the old repo's env (same seed, same trajectory),
       run once and recorded, so the port is known to match before diverging.
+      `scripts/parity_old_repo.py`, run 2026-10-17 against 206b740 on CPU:
+      all 6 presets × 3 option sets match exactly, both the Python reference
+      (3 episodes, same NumPy seed) and the JAX env (same key, arrivals drawn
+      on the device).
 - [ ] Port `CollectivePolicy`, JAX PPO + MAPPO and imitation.
 - [ ] Reproduce the reference numbers on `full` (heuristic 69; PPO ≥ 70
       after warm start is enough to call the port good; a full 50M-step
