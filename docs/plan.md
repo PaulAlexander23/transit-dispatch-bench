@@ -24,8 +24,17 @@ normalised scores for every environment.
 |---|---|---|---|
 | `elevator` | Line (floors) | Move, serve, hall-call direction | Collective control |
 | `bus` | Loop / route graph | Hold, skip stop, short-turn | Headway-based holding |
-| `train` | Line / graph with track blocks | Dwell, reorder, reroute | Timetable + first-come-first-served |
-| `fleet` | Grid / road graph | Assign vehicle to request, reposition | Nearest idle vehicle |
+| `train` | Line / graph with track blocks | Order trains at conflicts, dwell, short-turn, reroute | Timetable + first-come-first-served; prioritised replanning |
+| `fleet` | Grid / road graph | Assign vehicle to request, reposition | Nearest idle vehicle; per-tick matching |
+
+Disruptions (closed edges, failed vehicles, demand surges) are a core process
+that every env can switch on, not a train-only feature. The headline direction
+is rail with disruptions: no JAX rail env turned up in the survey, and the
+strongest rail baselines are planners, so the suite pairs a fast env with a
+planning baseline and, on small presets, a hindsight-optimal bound.
+
+The maths is in [formulation.md](formulation.md); the survey in
+[related-work.md](related-work.md).
 
 ## Where this comes from
 
@@ -75,10 +84,13 @@ the JAX env alone steps ~0.68M env steps/s).
 
 ## Design
 
-- **Core** (`src/transit_bench/core/`): nodes, edges with travel times,
-  vehicles (position, capacity, onboard passengers), passenger slots (origin,
-  destination, arrival time, status), and a demand generator (time-varying
-  Poisson OD matrix). Pure functions over `NamedTuple` state.
+- **Core** (`src/transit_bench/core/`): nodes, edges with travel times
+  and a capacity and speed factor that can change over time (`κ_e(t)`,
+  `σ_e(t)`: a disruption is a write to these), vehicles (position, capacity,
+  onboard passengers, status), passenger slots (origin, destination, arrival
+  time, status), a demand generator (time-varying Poisson OD matrix) and a
+  disruption generator (Markov, semi-Markov or scripted outages). Pure
+  functions over `NamedTuple` state.
 - **Envs** (`src/transit_bench/envs/<name>/`): each is a core config plus its
   own action set, constraints, observation and reward. Each has a Python
   reference sim, a JAX env, a heuristic and presets.
@@ -98,63 +110,527 @@ the JAX env alone steps ~0.68M env steps/s).
 
 ### Phase 0: skeleton
 
-- [ ] Survey existing benchmarks (Flatland, Jumanji, RL4CO, SUMO-RL, OR-Gym,
+- [x] Survey existing benchmarks (Flatland, Jumanji, RL4CO, SUMO-RL, OR-Gym,
       bus-holding RL papers) and record in a short `docs/related-work.md`
       what each covers, so the suite's niche is stated with evidence.
-- [ ] `pyproject.toml` with uv: Python 3.12, `jax` / `jax-cuda` groups
-      (CUDA 12 for the GTX 1080), optional `torch` cpu/cuda groups for the
-      SB3 wrapper, `dev` group (pytest, ruff). Package `transit_bench`.
-- [ ] pytest with a `slow` marker, ruff, GitHub Actions CI (CPU only).
-- [ ] Decide the core's state layout and the env API; write them down here.
+      Done: [related-work.md](related-work.md), and the maths in
+      [formulation.md](formulation.md).
+- [x] `pyproject.toml` with uv: Python 3.12, `jax-cuda` group
+      (CUDA 12 for the GTX 1080), `dev` group (pytest, ruff, scipy). Package
+      `transit_bench`. JAX and optax are core dependencies, since every env
+      is JAX; the `torch` groups wait for the SB3 wrapper (backlog).
+- [x] pytest with a `slow` marker, ruff, GitHub Actions CI (CPU only).
+- [x] Decide the core's state layout and the env API; write them down here.
+
+**Result.** The core is the API plus the shared machinery; each env keeps
+its own state layout.
+
+- **API** (`core/types.py`): `reset(key) -> (state, TimeStep)`,
+  `step(state, action) -> (state, TimeStep)`, with
+  `TimeStep(observation, reward, terminated, truncated, info)`. `info` holds
+  domain metrics with the same keys at reset and every step, so it scans.
+  Actions are `(n_agents,)` integers with `n_actions` choices each; the
+  observation is flat (`observation_size`). Env objects hold only static
+  config; all state is in a `NamedTuple`.
+- **Batching** (`core/vec.py`): `make_vec_env(env, n)` with auto-reset and
+  `terminal_obs`, written once for every env. Reset keys live in the
+  `VecState`, not in each env's state.
+- **Demand** (`core/demand.py`): the loop-free Poisson OD draw from the old
+  repo (Poisson total by inverse CDF, then origin and destination per slot)
+  as env-independent functions.
+- **Registry** (`registry.py`): `make("elevator/full-v0")`.
+- **State layout: per env, not one universal struct.** A shared
+  vehicles-on-a-graph struct would have forced the elevator's per-lift
+  kinematics and per-floor queues into a generic shape for no gain, and
+  broken parity. The plan's `κ_e(t)` / `σ_e(t)` arrays arrive with the
+  network module when the bus env needs edges (phase 2), and disruptions
+  write to those (phase 4). Revisit once two graph envs exist and the
+  common part is visible, rather than guessing it now.
 
 ### Phase 1: elevator port (regression check)
 
-- [ ] Port the Python reference (`building.py`) and the JAX env onto the core.
-- [ ] Parity test: new JAX env against new Python reference, every preset.
-- [ ] Parity test against the old repo's env (same seed, same trajectory),
+- [x] Port the Python reference (`building.py`) and the JAX env onto the core.
+      `envs/elevator/{sim,gym_env,jax_env}.py`; the "box" observation was
+      dropped (only "relative", used for learning, and "custom", read by the
+      heuristic, remain).
+- [x] Parity test: new JAX env against new Python reference, every preset.
+      `tests/test_elevator_jax.py`: 5 presets × 5 option sets, 2 episodes
+      each, exact observations in float64.
+- [x] Parity test against the old repo's env (same seed, same trajectory),
       run once and recorded, so the port is known to match before diverging.
-- [ ] Port `CollectivePolicy`, JAX PPO + MAPPO and imitation.
-- [ ] Reproduce the reference numbers on `full` (heuristic 69; PPO ≥ 70
+      `scripts/parity_old_repo.py`, run 2026-10-17 against 206b740 on CPU:
+      all 6 presets × 3 option sets match exactly, both the Python reference
+      (3 episodes, same NumPy seed) and the JAX env (same key, arrivals drawn
+      on the device).
+- [x] Port `CollectivePolicy`, JAX PPO + MAPPO and imitation.
+      Collective control is also written in JAX on the env state
+      (`CollectiveControl`), tested action for action against the Python
+      one, so imitation data is collected in one jitted rollout (16 s for
+      100k samples, against about a minute on the Python env before).
+- [x] Reproduce the reference numbers on `full` (heuristic 69; PPO ≥ 70
       after warm start is enough to call the port good; a full 50M-step
       run only with the user's go-ahead).
 
+**Result.** Ported, with exact parity, and a bug found in the old envs.
+
+- **A float32 bug in the old JAX/Warp envs.** On `full` the JAX heuristic
+  delivered 62.3 ± 0.1 per episode against the Python reference's
+  67.0 ± 0.4. In float64 JAX gave 67.0, so I compared float32 trajectories
+  against Python step by step. They split at the first door cycle: a 4 s
+  door timer counted down in forty 0.1 s substeps keeps 1.6e-6 s in
+  float32 (0.1 is not exact in binary), so doors stayed open one extra step
+  and every stop took 5 steps instead of 4. Fixed by snapping the timer to
+  zero within a thousandth of a substep (`sim._count_down`). That changes
+  nothing in float64, so the old-repo parity still holds there. Now float32
+  follows Python step for step under the heuristic (regression test
+  `test_float32_env_follows_python_under_the_heuristic`). Lesson: the
+  old repo's "float32 drifts but stays statistically the same" was never
+  tested statistically. A systematic bias hid behind it, and it made the
+  old PPO numbers (77 at 50M steps, trained and evaluated in float32) look
+  better against the heuristic (69, measured in float64) than they were.
+- **Reference numbers, fixed env** (`scripts/reproduce_elevator.py`,
+  GTX 1080). Random 6.2 ± 0.1, collective control 67.0 ± 0.1 (1,024
+  episodes each). PPO with the old tuned settings (1,024 envs × 8 steps,
+  minibatch 2,048, 10 epochs, lr 5.2e-5, 256 × 256) after imitating 100k
+  heuristic samples: **80.6 ± 1.4 after 10M steps** (seeds 80.2, 82.5,
+  79.1; 2 minutes each at 83k steps/s), so 20% above the heuristic. With
+  the doors fixed the env is easier and PPO gets further in a fifth of the
+  steps. The old repo's 69 for the heuristic is not reproduced: the Python
+  reference gives 67.0 ± 0.4 over seeds 0–99 and JAX agrees, so 69 was
+  probably a small-sample estimate.
+- **Throughput.** JAX PPO at 83k steps/s on `full` with 1,024 envs; the
+  old repo's 363k was on the Warp env, which was left behind.
+
 ### Phase 2: bus loop
 
-- [ ] Env: buses on a loop of stops, stochastic travel times, passenger
+- [x] Env: buses on a loop of stops, stochastic travel times, passenger
       arrivals per stop; action = holding time at a stop (discrete).
-- [ ] Heuristic: headway-based holding (hold to target headway).
-- [ ] Metrics: mean wait, headway variance, bunching rate.
-- [ ] Presets: few stops/buses → realistic route; time-varying demand.
-- [ ] Python reference + parity tests; PPO/MAPPO results vs heuristic.
+      Holding is a per-tick go/hold choice for a *deciding* bus (nobody
+      left to drop off or pick up); other buses' actions are ignored.
+- [x] Heuristic: headway-based holding (hold to target headway).
+- [x] Metrics: mean wait, headway variance, bunching rate.
+- [x] Presets: few stops/buses → realistic route; time-varying demand.
+      `loop → noisy → busy → peak → full`.
+- [x] Python reference + parity tests; PPO/MAPPO results vs heuristic.
 
-### Phase 3: train line
+**Result.** Env built and verified; RL does not beat the heuristic yet.
 
-- [ ] Env: one line, stations, track blocks (one train per block), dwell
-      decisions; disruptions (delays) injected at random.
-- [ ] Heuristic: keep to timetable, first-come-first-served at conflicts.
-- [ ] Metrics: total delay, passengers served, conflicts resolved.
+- **Model** (`envs/bus/`, maths in [formulation.md](formulation.md#bus)).
+  10 s ticks; boarding 2 s and alighting 1 s per passenger, which gives the
+  bunching feedback. Running times are lognormal, rounded up to whole ticks
+  so no float accumulates. Reward is minus passenger-minutes (waiting plus
+  on board) over the number of stops. The target headway is the
+  steady-state fixed point `H = Sτ / (B − Sλ(α+β))`. Random draws are an
+  explicit `Exogenous` per step (Powell's `W_{t+1}`), so the JAX env replays
+  Python's draws: exact parity on every preset, under random and heuristic
+  actions. Edges carry `core.network.EdgeState` (open, speed); a closed
+  edge already holds buses (tested), which phase 4 builds on.
+- **Bugs caught by parity.** In JAX, `int32 / int32` gives float32 even
+  with x64 on, and `sum` widens int32 to int64 under x64. Both now cast
+  explicitly.
+- **Baselines** (`scripts/bus_baselines.py`, 256 episodes, return / mean
+  wait / headway CV / bunching rate):
 
-### Phase 4: on-demand fleet
+  | Preset | Random | Always go | Holding | MAPPO 5M | MAPPO + BC 5M |
+  |---|---|---|---|---|---|
+  | `noisy` | −668 / 239 s / 0.79 / 0.13 | −605 / 219 s / 0.78 / 0.15 | **−594** / 166 s / 0.46 / 0 | −605 (= always go) | −597 / 172 s / 0.50 / 0 |
+  | `full` | −1066 / 257 s / 0.69 / 0.08 | −986 / 227 s / 0.71 / 0.11 | −986 / 180 s / 0.44 / 0 | −1806 (holds forever) | **−982** / 180 s / 0.44 / 0 |
+
+- **What was learned.**
+  - Holding evens headways (CV 0.78 → 0.46, no bunching) and cuts waits
+    by 25%, but saves only about 2% of total passenger time. The time it
+    saves at stops is spent on board. On `full` it ties with always-go.
+  - **MAPPO from scratch converges to never holding.** A hold costs
+    in-vehicle minutes immediately, while the benefit (less bunching) is
+    delayed and spread over many passengers. P(hold | deciding) went to
+    0.000. On `full` the greedy policy even held forever.
+  - Masking inactive agents out of the PPO loss (`active_agents`, added
+    to the PPO port for envs with sparse decisions) did not change this.
+    It is right in principle and is now in place for rail.
+  - **Imitation then fine-tuning** reproduces the heuristic (log-likelihood
+    ≈ 0) and keeps it, but does not improve on it in 5M steps (~15 s at
+    370k steps/s on `noisy`).
+- **Backlog from this phase:** a two-way headway heuristic (balance the
+  gaps ahead and behind); a named `headway` shaping (penalise uneven
+  departures, as much of the bus-holding literature does); a hold
+  *duration* action at the decision point (semi-MDP), so one decision
+  covers a whole hold; longer runs.
+
+### Phase 3: train network
+
+A job shop with blocking (see [formulation.md](formulation.md#train)). The
+action is an ordering choice at a conflict: which train enters a contested
+block first. Presets, one hard feature at a time:
+
+- [x] `line`: double track, stations, track blocks (capacity 1), timetable.
+- [x] `passing`: passing loops, mixed fast and slow trains (overtaking).
+- [x] `single`: single track with crossing points; deadlock becomes possible.
+      Detect it in JAX by repeated squaring of the wait-for matrix.
+- [ ] `junction`: a small network with route choice.
+- [x] Heuristics: keep to timetable with first-come-first-served at
+      conflicts; prioritised replanning (the Flatland 2020 winners' approach),
+      so RL is compared with a planner, not only a rule.
+      Done: first come, first served, and *section reservation* (never enter
+      a section against an oncoming train), the interlocking principle
+      single-track lines run on. Prioritised replanning is still to do
+      (backlog).
+- [x] Metrics: total and weighted delay, passengers served, deadlocks,
+      conflicts resolved. Done: delay per train, deadlock rate, trains
+      finished, held and blocked counts. Passengers are not modelled yet.
+- [x] Hindsight bound on small presets: solve the alternative-graph MILP
+      after the episode with all disruptions known (e.g. HiGHS via `highspy`;
+      check the dependency first). Report each policy's gap to it.
+      Done: `envs/train/bound.py`, `scripts/bound_eval.py`; result below.
+- [ ] Optional: load a few small DISPLIB instances as test networks.
+
+**Result.** Env built and verified; RL matches the rules where they are
+optimal and copies section reservation, but does not yet improve on it.
+
+- **Model** (`envs/train/`). `infra.build` lays out stations and
+  sections of blocks (double or single track, optional loop platforms),
+  routes and a timetable with 5% slack. Each tick a *ready* train with a
+  free next block is *deciding*: GO enters, WAIT stays. Blocks hold one
+  train, and a train holds its block until it enters the next (blocking).
+  Running times are lognormal; incidents (2% of block entries) add
+  exponential delays (mean 2 min), the primary delays. Reward is minus
+  the change in total projected lateness, so the return telescopes to
+  minus total arrival delay (tested exactly). Deadlock detection in JAX:
+  ⌈log₂ N⌉ boolean matrix squarings of the wait-for relation (tested on a
+  constructed head-on cycle with a third train queued behind).
+- **Design fix found by testing the heuristic: synchronous ticks.** At
+  first a train with one tick left became ready during the tick and acted
+  on an action chosen before it was deciding. So two trains could enter
+  a single-track section from both ends, and section reservation behaved
+  exactly like first come, first served (20% deadlocks). Now ready and
+  deciding are judged once at the start of the tick, a block freed during
+  a tick opens on the next one (like a signal clearing), and countdowns
+  happen at the end. `active_agents` is then exactly the set of trains
+  whose action matters.
+- **Baselines** (`scripts/train_baselines.py`, 512 episodes; delay per
+  train in minutes, deadlock rate):
+
+  | Preset | Random | FCFS | Reservation | MAPPO 5M | Clone | Clone + MAPPO 5M |
+  |---|---|---|---|---|---|---|
+  | `line` | 2.97 / 0 | 0.86 / 0 | 0.86 / 0 | 0.85 / 0 | | |
+  | `passing` | 4.27 / 0 | 2.16 / 0 | 2.16 / 0 | 2.15 / 0 | 2.15 / 0 | 2.15 / 0 |
+  | `single` | 9.57 / 0.39 | 4.92 / 0.22 | **1.48 / 0.025** | 4.68 / 0.20 | 1.63 / 0.029 | 1.87 / 0.041 |
+
+  MAPPO trains at 175–235k steps/s (5M steps in under 30 s).
+- **What was learned.**
+  - **From scratch, MAPPO finds first come, first served and never
+    discovers deadlock avoidance.** A deadlock is rare and catastrophic,
+    and its cost arrives long after the decision that caused it, which
+    16-step rollouts with GAE cannot credit. This is the Flatland lesson
+    in miniature.
+  - **Cloning the rule failed at first, for two reasons, each found by
+    measuring accuracy on the rare WAIT decisions (0.09% of agent-actions)
+    rather than the average log-likelihood (−0.008, which looked
+    perfect).** (1) The observation lacked the conflict: an oncoming train
+    waiting at the far end of a section stands on a platform that is not on
+    this train's route. Added fields: next section's oncoming occupant, and
+    oncoming trains about to enter it before or after this one. (2) "An
+    oncoming train is in my next section" was also true for trains about
+    to move onto a platform, not into the section, so a field for "my next
+    block enters that section" was needed. After both, WAIT accuracy went
+    from 60% to 100% and the clone matches the rule. Masking inactive
+    agents out of the imitation loss (as in PPO) did not help by itself.
+  - Fine-tuning the clone with PPO for 5M steps drifts slightly worse
+    (1.63 → 1.87 min, deadlocks 2.9% → 4.1%): the same credit problem.
+  - On `passing`, no rule or learner beats FCFS yet. Holding a stopping
+    train in a loop for a following express is the decision that could
+    help, and it needs look-ahead along the route behind the train.
+- **Common random numbers.** Running-time noise and incidents were drawn
+  per tick, so a train's running time depended on when it entered a
+  block, and "the same scenario under another policy" was not defined.
+  They are now drawn per train and route position at reset (a `Trip` in
+  the state). The distribution is unchanged (each train enters each block
+  once), but a seed now fixes the scenario for every policy, which also
+  cuts the variance of policy comparisons. Numbers after this change
+  differ from the tables above by sampling noise only.
+- **Hindsight bound** (`envs/train/bound.py`). After an episode every
+  draw is known: the trip, and the closures (the disruption process does
+  not depend on the trains, so a rollout of all-WAIT recovers them). The
+  best schedule for that scenario is a MILP over integer entry ticks: route
+  order with the env's rounded block times, departures, one big-M
+  disjunction per pair of trains sharing a block (with the env's +1 tick
+  for a freed block), one per train and closure window, and total
+  lateness as the objective. Any env trajectory in which all trains
+  finish is feasible for it with the same cost, so its optimum is a lower
+  bound (tested on `single` and `blockage`, and zero on a calm timetable).
+  About 150 binaries on `single`; HiGHS solves it in 0.2–1.5 s on average.
+  *Dependency check:* `highspy` 1.15.1 is MIT (licence expression in the
+  wheel metadata), depends only on NumPy, ships cp312 manylinux wheels
+  (about 7 MB); added as the optional extra `bound` and to the dev group,
+  not as a core dependency.
+- **Gaps to the bound** (`scripts/bound_eval.py`, 200 scenarios per
+  preset, 720-tick horizon so trains finish; minutes per train, over the
+  episodes where the policy finished every train):
+
+  | Preset | Bound | FCFS | Section reservation | Route setting | Route setting above bound |
+  |---|---|---|---|---|---|
+  | `line` | 0.88 | 0.88 | 0.88 | 0.88 | 1% |
+  | `passing` | 1.56 | 2.16 | 2.16 | 2.16 | **28%** |
+  | `single` | 1.04 | 0.62\* | 0.99\* | 1.11 | 8% |
+  | `blockage` | 2.50 | 0.90\* | 1.89\* | 2.66 | 12% |
+
+  \* Over the episodes it finished (FCFS finishes 77% on `single`, 59% on
+  `blockage`; route setting 99.5% and 98%), so these are the easy ones;
+  compare each with the bound on the same episodes: FCFS is at the bound
+  (gap 0.00) whenever it does not deadlock, section reservation within
+  0.05 min. All solves were optimal except 2% on `blockage`, which hit the
+  30 s limit and report the dual bound (still valid).
+- **What the bound says.**
+  - `line` and `single` leave almost nothing to learn: the rules are
+    within 1–8% of a dispatcher who knows the future. On single track the
+    whole problem is avoiding deadlocks; once a rule does that, little
+    remains. This explains the RL results above better than the credit
+    problem alone: there was no headroom to find.
+  - **`passing` is where the headroom is**: 28% of the delay (0.6 min per
+    train, at least 0.14 in every scenario) is avoidable, and no rule
+    captures any of it. It comes from overtaking: holding a stopping train
+    in a loop so an express can pass. That is the next target for a
+    better rule, a look-ahead planner and RL.
+  - The bound knows the future, so part of any gap could be the value of
+    information, which no real-time policy can capture. Checked on
+    `passing` (100 scenarios): without incidents the gap is 39%, and fully
+    deterministic it is **70%** (route setting 1.01 vs 0.30 min per
+    train). So the gap is policy, not information.
+- **Rule: give way to the express** (`GiveWayToExpress`, now part of the
+  env heuristic where there are expresses). Found by reading the bound's
+  schedule on a deterministic scenario: the optimum holds a stopping train
+  at the *last loop before the terminus* for 8 ticks, because the
+  terminus has no loop and the express behind it would otherwise wait out
+  its dwell there (15 ticks). The rule: a stopping train on a loop
+  platform waits for an express behind it (or beside it on the main line)
+  when, in nominal ticks, the express's loss from following it (through
+  the section, plus the platform time if there is no loop at the end)
+  exceeds its own wait. Two bugs on the way, both found by the rule
+  never firing: pricing only the section (the gain is at the terminus),
+  and requiring the express to be strictly behind (it is usually on the
+  main platform of the same station when the stopping train decides).
+  **On deterministic `passing` it equals the bound exactly** (tested).
+  With noise and incidents (`scripts/bound_eval.py`, 200 scenarios):
+
+  | Policy on `passing` | Delay/train | Above bound |
+  |---|---|---|
+  | Route setting (= FCFS here) | 2.16 | 28% |
+  | **Give way to express** | **1.86** | **16%** |
+  | Hindsight bound | 1.56 | |
+
+  The remaining 16% is noise and incidents: the nominal-tick rule cannot
+  see a late express or a long dwell coming, and some of it is the value
+  of information. This is the headroom a learner or a stochastic
+  look-ahead could go after on `passing`.
+### Phase 4: disruptions
+
+- [x] Core disruption process: edge outages (`κ_e = 0`), slow running
+      (`σ_e > 1`), vehicle failures, demand surges. Markov, semi-Markov
+      (lognormal durations, elapsed time observed) and scripted modes.
+      Done for edge outages and slow running (`core/disruption.py`);
+      vehicle failures and demand surges are still to do.
+- [x] Observation switch: remaining outage time visible or hidden.
+- [x] Train `blockage` preset with short-turn, cancel and reroute actions.
+      Done: `blockage` (random closures on the single-track line) and
+      `response` (longer closures plus TERMINATE, which cancels a trip
+      before departure or short-turns it at a platform). Reroute needs
+      route choice, so it comes with the `junction` preset (Phase 3); the
+      return half of a short-turn needs vehicle circulation (backlog).
+- [ ] Switch disruptions on for elevator (car out of service) and bus
+      (road closure, breakdown). The bus env already holds buses at a
+      closed edge; it is not yet wired to the process.
+- [x] Evaluation: in-distribution, shift (trained without, tested with),
+      and CVaR at 10% of delay alongside the mean.
+
+**Result.** Disruptions work end to end on the train env; the best answer to
+them so far is a better rule, not RL.
+
+- **Process** (`core/disruption.py`). Each eligible edge is up or down;
+  both random modes draw the outage's full duration at onset and count it
+  down. For exponential durations this is the same process as a per-tick
+  repair chance (memoryless), so one mechanism serves Markov and
+  semi-Markov. Tested: outage rate, mean and CV of durations, and the
+  stationary fraction down `λm/(1+λm)`. NumPy and JAX agree exactly given
+  the same draws. The train env advances it at the *end* of each tick (so
+  the policy sees the state it will act under), over section blocks only.
+  It observes per look-ahead block how long the block has been down, and
+  how long it has left only when `observe_remaining` is set.
+- **`train/blockage-v0`**: `single` plus Markov closures (0.1 per section
+  block per hour, mean 10 min: about 0.8 outages an episode).
+- **A third rule, route setting, found by reading the deadlocks.** The
+  deadlocks section reservation still allowed are four-train cycles
+  through two sections and the two platforms of one station (described in
+  `sim.route_setting`). Entering a section only when the platform at its
+  far end is free, i.e. station-to-station route setting as real
+  interlockings do, removes them on this line. It is now the train env's
+  heuristic (`TrainEnv.heuristic()`).
+- **Results** (`scripts/disruption_eval.py`, 1,024 episodes; delay per
+  train in minutes, mean of the worst 10% of episodes, deadlock rate):
+
+  | Policy | `single` | `blockage` |
+  |---|---|---|
+  | First come, first served | 5.24 / 30.5 / 0.23 | 9.01 / 34.6 / 0.39 |
+  | Section reservation | 1.42 / 7.25 / 0.021 | 4.05 / 25.0 / 0.099 |
+  | **Route setting** | **1.15 / 4.36 / 0** | **3.05 / 15.7 / 0.003** |
+  | Clone of route setting, trained on `single` | 1.15 / 4.36 / 0 | 3.05 / 15.7 / 0.003 |
+  | That clone + MAPPO 5M on `blockage` | 1.59 / 8.89 / 0.030 | 4.17 / 25.5 / 0.105 |
+  | MAPPO 5M from scratch under the shield | 1.15 / 4.36 / 0 | 3.05 / 15.7 / 0.003 |
+
+- **What was learned.**
+  - Blockages roughly triple delay and quadruple the tail (CVaR 4.4 →
+    15.7 min under route setting), and blocked trains bunch, which makes
+    deadlock cycles more likely. The tail metric moves far more than the
+    mean, which is why it belongs in the benchmark.
+  - Shift: a clone that copies a rule exactly transfers exactly, because
+    the rule never looked at the disruption fields. A learned policy that
+    used them could not be tested this way; that needs a policy that
+    beats the rules first.
+  - **PPO fine-tuning destroys the deadlock avoidance it starts with**
+    (deadlocks 0 → 3% on `single`, 0.3% → 10.5% on `blockage`, after 5M
+    steps at lr 5e-5). The penalty for a deadlock arrives long after the
+    decision that caused it, so the policy gradient does not protect the
+    rare WAIT decisions that prevent it, and noise erodes them. Candidates:
+    a deadlock penalty (named shaping), longer rollouts and higher γ, a
+    KL penalty to the clone, or action masking that forbids unsafe GO
+    (a safety shield, as in the 2026 shielding paper in related work).
+  - **Tried the shield** (`TrainEnv(shield=True)`: any GO route setting
+    forbids becomes WAIT, and a vetoed train is not an active agent).
+    Under it, always-GO *is* route setting (tested), so the shield makes
+    the rule the floor. MAPPO from scratch under the shield converges to
+    exactly that floor in 5M steps (identical numbers to route setting):
+    safe, but it found no extra holds that pay. Improving on the rule
+    needs either decisions the rule does not make (the response actions
+    below) or a signal for the holds that do pay (e.g. holding a train at
+    a crossing loop for a late oncoming one).
+  - With only go/wait, a dispatcher has few levers once a block is closed.
+    The disruption *response* actions (short-turn, cancel, reroute) are
+    where a learner could add value over the rules.
+- **Response action: TERMINATE** (`TrainConfig.terminate_penalty` > 0,
+  `train/response-v0`). A ready train that has not departed, or stands on
+  a platform with blocks still ahead, may end its trip: it leaves the
+  network at once, freeing its platform, and its lateness is frozen at
+  its projected lateness plus 5 minutes per missed call (the mean
+  passenger wait at a 10-minute headway). The return still telescopes to
+  minus total cost (tested). Before departure it is a cancellation; at an
+  intermediate station it is the outbound half of a short-turn. Such a
+  train is an active agent even when its next block is taken or closed,
+  since that is when terminating is worth considering. Observation: two
+  more head fields (can terminate; calls it would miss). JAX matches
+  Python step for step under random three-action play and the new rule.
+- **Rule: `TerminateWhenStuck`** (the `response` heuristic): route
+  setting, plus terminate a train whose next block is closed when
+  `factor` × the expected outage time left exceeds its penalty, and break
+  any deadlock by terminating the deadlocked train that misses fewest
+  calls.
+- **Results** (`scripts/response_eval.py`, 2,048 episodes, seed 7; cost
+  per train in minutes = delay + penalties, mean ± s.e.; CVaR10;
+  deadlock rate; trains terminated per episode):
+
+  | Policy | Cost | CVaR10 | Deadlocks | Terminated |
+  |---|---|---|---|---|
+  | Route setting (never terminates) | 5.23 ± 0.18 | 26.4 | 0.010 | 0 |
+  | Terminate when stuck, factor 1 | 3.80 ± 0.12 | 17.1 | 0.004 | 0.59 |
+  | **Terminate when stuck, factor 2** | **3.70 ± 0.11** | **15.8** | **0.001** | 0.72 |
+  | MAPPO 5M from scratch, shielded | 5.23 ± 0.18 | 26.4 | 0.010 | 0 |
+  | Clone of the rule, shielded | 3.72 ± 0.11 | 16.0 | 0.001 | 0.72 |
+  | Clone + MAPPO 5M, shielded | 3.72 ± 0.11 | 16.0 | 0.001 | 0.72 |
+
+  A sweep over outage length (10–30 min), rate (0.1–0.2 per block-hour),
+  penalty (2–10 min per call) and observability: the rule beats route
+  setting everywhere, by 13–50% on the mean and up to half the tail.
+- **What was learned.**
+  - **Terminating is a tail-risk tool**: it cuts CVaR10 by 40% for a 30%
+    mean saving, and deadlocks fall tenfold because a terminated train
+    frees a platform that a cycle would have needed.
+  - **The myopic threshold undervalues waiting.** With factor 1 (wait
+    cost = the blocked train's own wait), knowing the true time left was
+    *no better* than assuming the mean, and sometimes worse: told that an
+    outage will be short, the rule waits, but the trains queued behind
+    wait too. Factor 2 is better and factors 1.5–5 are identical (with
+    the mean estimate, every blocked train with up to 5 missed calls then
+    terminates). Seeing the true time left gains 0.07 min with factor 2,
+    within noise. The queue behind the train is what a better rule (or a
+    learner) should price.
+  - **MAPPO from scratch never discovers TERMINATE.** It costs 5–25
+    minutes at once, and the delay it saves arrives over the following
+    tens of minutes, spread across other trains: the credit problem
+    again, now with an immediate penalty in front of a delayed benefit.
+    Starting from a clone keeps the rule's behaviour (the shield keeps
+    GO/WAIT safe, so fine-tuning no longer erodes it), but 5M steps found
+    no improvement.
+### Phase 5: on-demand fleet
 
 - [ ] Env: grid graph, requests with OD, vehicle assignment + repositioning.
-- [ ] Heuristic: nearest idle vehicle.
+- [ ] Heuristics: nearest idle vehicle; per-tick bipartite matching.
 
-### Phase 5: benchmark harness
+### Phase 6: benchmark harness
 
-- [ ] One command runs random, heuristic and PPO on every env/preset over
+- [x] One command runs random, heuristic and PPO on every env/preset over
       seeds and writes a results table (normalised scores + domain metrics),
-      like the old repo's `benchmark.py --readme`.
+      like the old repo's `benchmark.py --readme`. Done for the baselines:
+      `python -m transit_bench.benchmark --write docs/results.md`; PPO rows
+      come from the per-env scripts for now (`reproduce_elevator.py`,
+      `bus_baselines.py`, `train_baselines.py`, `disruption_eval.py`).
+
+**Result.** [results.md](results.md): 14 envs × 2–4 baselines × 512
+episodes in about 2 minutes on the GTX 1080. Running every rule on every
+preset caught a regression at once: route setting was the train heuristic,
+and on double track it was *worse* than first come, first served (1.62 vs
+0.87 min per train on `line`), because waiting for a free far platform
+stops trains following each other into a one-way section. It now applies
+only to sections used in both directions (tested: on double track it is
+first come, first served); single-track numbers are unchanged. Lesson:
+normalising by the heuristic makes the heuristic part of the benchmark's
+definition, so it must be checked on every preset, not just the one it was
+designed for.
+
+### Phase 7: coupled modes (stretch)
+
+- [ ] Bus bridging: when a rail block closes, buses run a replacement
+      service between the affected stations. Train and bus envs share one
+      core state. No paper found does short-turning and bridging jointly.
 
 ## Backlog
 
 - GTFS loader for real bus and train networks and timetables.
 - Graph-network policies (the old repo has a GNN experiment in `scripts/gnn.py`).
+  Needed for rail generalisation: train on random networks (Flatland-style
+  generator), test on unseen ones and on DISPLIB networks.
+- Train env: prioritised replanning baseline (space-time reservations
+  along each train's route, replanned on delay); a look-behind observation
+  (the next train behind on the same track, its speed and delay) for
+  overtaking on `passing`; passengers and connections; longer PPO runs and
+  longer rollouts for deadlock credit; a deadlock penalty or early
+  termination as a named shaping.
+- Safe RL for rail: mask GO actions that a deadlock check (route setting,
+  or a look-ahead on the wait-for graph) rules out, so exploration cannot
+  cause deadlocks; compare with a deadlock-penalty shaping.
+- Adversarial disruptions: a second agent picks which edge to block
+  (attacker–defender), for a worst-case robustness score.
+- RL proposes, a solver repairs: RL picks train orderings and a replanner
+  makes them feasible.
 - Semi-MDP / event-driven decisions, if fixed ticks prove too coarse.
+- Bound: a `--bound` option in the harness; a TERMINATE-aware MILP
+  (optional calls with a penalty) for `response`; slow running (speed
+  depends on the entry tick); a rolling-horizon MILP policy (DLA) using
+  only what is known at decision time, to split the gap into
+  value-of-information and policy suboptimality.
+- Harder train presets with headroom: denser single-track timetables
+  (more trains, shorter headways), and `passing` with a look-behind
+  observation (the train behind and its speed).
+- Train response actions: vehicle circulation (each eastbound trip's
+  vehicle forms a westbound trip after a layover), so a short-turn also
+  runs the return trip early from the turning station and gets credit
+  for the calls it serves; partial cancellations that skip stops; a
+  rule that prices the queue behind a blocked train (trains waiting for
+  it × expected time left); a value baseline for TERMINATE from rollouts
+  (DLA, Powell's fourth class).
 - Publish to GitHub (`PaulAlexander23/transit-dispatch-bench`, public);
   confirm with the user first.
 
 ## Open questions
 
 - Fixed tick length per env: one shared unit (seconds) or per-env?
+  Leaning: one shared unit (seconds), each env sets its tick length; coupled
+  modes (phase 7) need a common clock.
 - Single-agent central controller, multi-agent, or both as first-class?
   (The old repo had both; MAPPO was the newer path.)
