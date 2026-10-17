@@ -13,7 +13,9 @@ heuristic, and a normalised score (random = 0, heuristic = 1).
 | `train/*` | Blocks of track, double or single | Go or wait, per deciding train | Station-to-station route setting |
 
 Disruptions (blocked or slowed edges; Markov, semi-Markov or scripted) are a
-core process; `train/blockage-v0` switches them on.
+core process; `train/blockage-v0` switches them on, and `train/response-v0`
+adds a TERMINATE action (cancel or short-turn a train, at a cost per missed
+call).
 
 ```sh
 uv sync --group jax-cuda            # or plain `uv sync` for CPU JAX

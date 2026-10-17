@@ -346,9 +346,12 @@ optimal and copies section reservation, but does not yet improve on it.
       Done for edge outages and slow running (`core/disruption.py`);
       vehicle failures and demand surges are still to do.
 - [x] Observation switch: remaining outage time visible or hidden.
-- [ ] Train `blockage` preset with short-turn, cancel and reroute actions.
-      The preset exists (random closures on the single-track line); the
-      response actions are still to do.
+- [x] Train `blockage` preset with short-turn, cancel and reroute actions.
+      Done: `blockage` (random closures on the single-track line) and
+      `response` (longer closures plus TERMINATE, which cancels a trip
+      before departure or short-turns it at a platform). Reroute needs
+      route choice, so it comes with the `junction` preset (Phase 3); the
+      return half of a short-turn needs vehicle circulation (backlog).
 - [ ] Switch disruptions on for elevator (car out of service) and bus
       (road closure, breakdown). The bus env already holds buses at a
       closed edge; it is not yet wired to the process.
@@ -418,6 +421,59 @@ them so far is a better rule, not RL.
   - With only go/wait, a dispatcher has few levers once a block is closed.
     The disruption *response* actions (short-turn, cancel, reroute) are
     where a learner could add value over the rules.
+- **Response action: TERMINATE** (`TrainConfig.terminate_penalty` > 0,
+  `train/response-v0`). A ready train that has not departed, or stands on
+  a platform with blocks still ahead, may end its trip: it leaves the
+  network at once, freeing its platform, and its lateness is frozen at
+  its projected lateness plus 5 minutes per missed call (the mean
+  passenger wait at a 10-minute headway). The return still telescopes to
+  minus total cost (tested). Before departure it is a cancellation; at an
+  intermediate station it is the outbound half of a short-turn. Such a
+  train is an active agent even when its next block is taken or closed,
+  since that is when terminating is worth considering. Observation: two
+  more head fields (can terminate; calls it would miss). JAX matches
+  Python step for step under random three-action play and the new rule.
+- **Rule: `TerminateWhenStuck`** (the `response` heuristic): route
+  setting, plus terminate a train whose next block is closed when
+  `factor` × the expected outage time left exceeds its penalty, and break
+  any deadlock by terminating the deadlocked train that misses fewest
+  calls.
+- **Results** (`scripts/response_eval.py`, 2,048 episodes, seed 7; cost
+  per train in minutes = delay + penalties, mean ± s.e.; CVaR10;
+  deadlock rate; trains terminated per episode):
+
+  | Policy | Cost | CVaR10 | Deadlocks | Terminated |
+  |---|---|---|---|---|
+  | Route setting (never terminates) | 5.23 ± 0.18 | 26.4 | 0.010 | 0 |
+  | Terminate when stuck, factor 1 | 3.80 ± 0.12 | 17.1 | 0.004 | 0.59 |
+  | **Terminate when stuck, factor 2** | **3.70 ± 0.11** | **15.8** | **0.001** | 0.72 |
+  | MAPPO 5M from scratch, shielded | 5.23 ± 0.18 | 26.4 | 0.010 | 0 |
+  | Clone of the rule, shielded | 3.72 ± 0.11 | 16.0 | 0.001 | 0.72 |
+  | Clone + MAPPO 5M, shielded | 3.72 ± 0.11 | 16.0 | 0.001 | 0.72 |
+
+  A sweep over outage length (10–30 min), rate (0.1–0.2 per block-hour),
+  penalty (2–10 min per call) and observability: the rule beats route
+  setting everywhere, by 13–50% on the mean and up to half the tail.
+- **What was learned.**
+  - **Terminating is a tail-risk tool**: it cuts CVaR10 by 40% for a 30%
+    mean saving, and deadlocks fall tenfold because a terminated train
+    frees a platform that a cycle would have needed.
+  - **The myopic threshold undervalues waiting.** With factor 1 (wait
+    cost = the blocked train's own wait), knowing the true time left was
+    *no better* than assuming the mean, and sometimes worse: told that an
+    outage will be short, the rule waits, but the trains queued behind
+    wait too. Factor 2 is better and factors 1.5–5 are identical (with
+    the mean estimate, every blocked train with up to 5 missed calls then
+    terminates). Seeing the true time left gains 0.07 min with factor 2,
+    within noise. The queue behind the train is what a better rule (or a
+    learner) should price.
+  - **MAPPO from scratch never discovers TERMINATE.** It costs 5–25
+    minutes at once, and the delay it saves arrives over the following
+    tens of minutes, spread across other trains: the credit problem
+    again, now with an immediate penalty in front of a delayed benefit.
+    Starting from a clone keeps the rule's behaviour (the shield keeps
+    GO/WAIT safe, so fine-tuning no longer erodes it), but 5M steps found
+    no improvement.
 ### Phase 5: on-demand fleet
 
 - [ ] Env: grid graph, requests with OD, vehicle assignment + repositioning.
@@ -470,6 +526,13 @@ designed for.
 - RL proposes, a solver repairs: RL picks train orderings and a replanner
   makes them feasible.
 - Semi-MDP / event-driven decisions, if fixed ticks prove too coarse.
+- Train response actions: vehicle circulation (each eastbound trip's
+  vehicle forms a westbound trip after a layover), so a short-turn also
+  runs the return trip early from the turning station and gets credit
+  for the calls it serves; partial cancellations that skip stops; a
+  rule that prices the queue behind a blocked train (trains waiting for
+  it × expected time left); a value baseline for TERMINATE from rollouts
+  (DLA, Powell's fourth class).
 - Publish to GitHub (`PaulAlexander23/transit-dispatch-bench`, public);
   confirm with the user first.
 

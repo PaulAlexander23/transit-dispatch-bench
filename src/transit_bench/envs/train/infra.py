@@ -59,10 +59,16 @@ class TrainConfig:
     incident_seconds: float = 120.0
     # Blockages of section blocks (see core.disruption); none by default.
     disruption: DisruptionConfig = DisruptionConfig()
+    # > 0 enables the TERMINATE response action (cancel a trip before it
+    # departs, or short-turn it at a platform); each scheduled call the
+    # train then misses costs this many minutes.
+    terminate_penalty: float = 0.0
 
     def __post_init__(self):
         if self.n_stations < 2 or self.blocks_per_section < 1:
             raise ValueError("need at least 2 stations and 1 block per section")
+        if self.terminate_penalty < 0:
+            raise ValueError("terminate_penalty must be >= 0")
         if self.single_track and self.passing_loops:
             raise ValueError("single-track lines pass at their crossing loops only")
 
@@ -82,6 +88,14 @@ PRESETS["single"] = replace(
 PRESETS["blockage"] = replace(
     PRESETS["single"],
     disruption=DisruptionConfig(mode="markov", rate_per_hour=0.1, mean_seconds=600.0),
+)
+# Longer outages (20 minutes on average) and the TERMINATE response: cancel
+# or short-turn a train, at 5 minutes per missed call (the mean passenger
+# wait for the next train at a 10-minute headway).
+PRESETS["response"] = replace(
+    PRESETS["blockage"],
+    disruption=DisruptionConfig(mode="markov", rate_per_hour=0.1, mean_seconds=1200.0),
+    terminate_penalty=5.0,
 )
 
 
@@ -106,6 +120,10 @@ class Infra(NamedTuple):
     far_platform: np.ndarray
     # (sections,) bool: used by trains in both directions (single track)
     section_shared: np.ndarray
+    # (trains, L + 1): calls (stops, dwell > 0) at route index q or later.
+    # A train terminated on the block at p misses calls_from[p + 1]; before
+    # its departure, calls_from[0].
+    calls_from: np.ndarray
 
 
 def build(config: TrainConfig) -> Infra:
@@ -200,6 +218,8 @@ def build(config: TrainConfig) -> Infra:
         secs = section_of[route[i]]
         used[secs[secs >= 0], direction[i]] = True
     section_shared = used.all(axis=1)
+    calls = np.concatenate([dwell > 0, np.zeros((T, 1), bool)], axis=1)
+    calls_from = np.cumsum(calls[:, ::-1], axis=1)[:, ::-1]
     return Infra(
         n_blocks,
         station_of,
@@ -214,4 +234,5 @@ def build(config: TrainConfig) -> Infra:
         next_section,
         far_platform,
         section_shared,
+        calls_from,
     )

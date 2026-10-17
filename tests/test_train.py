@@ -14,12 +14,14 @@ from transit_bench.envs.train.heuristic import FirstComeFirstServed, SectionRese
 from transit_bench.envs.train.infra import EAST, WEST, build
 from transit_bench.envs.train.sim import (
     GO,
+    TERMINATE,
     WAIT,
     Exogenous,
     TrainSim,
     first_come_first_served,
     route_setting,
     section_reservation,
+    terminate_when_stuck,
 )
 
 
@@ -211,18 +213,21 @@ def replay(preset, policy, seed):
 @pytest.mark.parametrize("preset", PRESETS)
 def test_jax_matches_python_step_for_step(preset):
     for seed in range(2):
-        replay(preset, lambda sim, rng: rng.integers(2, size=len(sim.pos)), seed)
+        # Three actions everywhere: without a terminate_penalty, TERMINATE is a WAIT.
+        replay(preset, lambda sim, rng: rng.integers(3, size=len(sim.pos)), seed)
         replay(preset, lambda sim, rng: first_come_first_served(sim), seed)
         replay(preset, lambda sim, rng: section_reservation(sim), seed)
         replay(preset, lambda sim, rng: route_setting(sim), seed)
+        replay(preset, lambda sim, rng: terminate_when_stuck(sim), seed)
 
 
 @pytest.mark.usefixtures("x64")
 @pytest.mark.parametrize("preset", PRESETS)
 def test_jax_heuristics_match_python(preset):
     env = TrainEnv(preset)
+    rule = terminate_when_stuck if env.n_actions == 3 else route_setting
     for policy, reference in [
-        (env.heuristic(), route_setting),
+        (env.heuristic(), rule),
         (SectionReservation(env), section_reservation),
         (FirstComeFirstServed(env), first_come_first_served),
     ]:
@@ -320,7 +325,7 @@ def test_observation_shows_an_oncoming_rival_for_the_section():
         sim.step([WAIT, WAIT])
     width = HEAD_FIELDS + BLOCK_FIELDS * LOOKAHEAD
     obs = sim.observe().reshape(2, width)
-    entering, inside, before, after = obs[:, 9], obs[:, 10], obs[:, 11], obs[:, 12]
+    entering, inside, before, after = obs[:, HEAD_FIELDS - 4 : HEAD_FIELDS].T
     assert list(entering) == [1, 1]
     assert list(inside) == [0, 0]
     assert list(before) == [0, 1]  # train 1 sees train 0 go first
@@ -377,3 +382,72 @@ def test_route_setting_lets_trains_follow_on_double_track():
         assert route_setting(sim) == first_come_first_served(sim)
         _, _, terminated, truncated, _ = sim.step(route_setting(sim))
         done = terminated or truncated
+
+
+# -- response actions ------------------------------------------------------------
+
+
+def responsive(**changes):
+    """One train each way on the double-track line, calm, TERMINATE enabled."""
+    return replace(
+        PRESETS["line"],
+        trains_per_direction=1,
+        running_cv=0,
+        incident_probability=0,
+        terminate_penalty=5.0,
+        **changes,
+    )
+
+
+def test_cancelling_a_train_before_departure_costs_every_call():
+    sim = TrainSim(responsive())
+    assert TrainEnv(responsive()).n_actions == 3 and TrainEnv("line").n_actions == 2
+    # Train 0 is due out now; train 1 (westbound) only at 150 s.
+    assert sim.can_terminate(0) and not sim.can_terminate(1)
+    _, reward, _, _, info = sim.step([TERMINATE, GO])
+    assert sim.finished(0) and info["terminated"] == 1 and info["missed"] == 5
+    assert reward == pytest.approx(-5 * 5.0)  # 5 calls x 5 minutes, and no delay yet
+
+
+def test_short_turning_frees_the_platform_and_misses_the_calls_beyond():
+    c = responsive()
+    sim = TrainSim(c)
+    infra = sim.infra
+    total = 0.0
+    turned = None
+    for _ in range(200):
+        on_platform = sim.pos[0] >= 0 and infra.station_of[sim.here(0)] == 2
+        turn = on_platform and sim.ready(0)
+        if turn:
+            turned = sim.here(0)
+            assert sim.can_terminate(0) and sim.missed_calls(0) == 2  # stations 3 and 4
+        _, reward, terminated, _, info = sim.step([TERMINATE if turn else GO, GO])
+        total += reward
+        if turn:
+            assert info["missed"] == 2 and sim.occupant[turned] == -1
+        if terminated:
+            break
+    assert turned is not None and terminated
+    # The return still telescopes to minus the trains' final lateness, which
+    # for the turned train includes the penalty.
+    assert sim.arrival_delay[0] >= 2 * 5.0 * 60
+    assert total == pytest.approx(-sum(sim.arrival_delay) / 60)
+
+
+def test_a_train_held_by_a_closed_block_can_terminate_and_is_active():
+    from transit_bench.core.disruption import DisruptionConfig
+
+    base = responsive()
+    first_section = int(build(base).route[0][1])
+    window = ((first_section, 0.0, 3000.0),)
+    d = DisruptionConfig(mode="scripted", scripted=window, observe_remaining=True)
+    env = TrainEnv(replace(base, disruption=d))
+    state, _ = env.reset(jax.random.key(0))
+    step = jax.jit(env.step)
+    while not (state.pos[0] == 0 and env.ready(state)[0]):  # onto the platform, dwell
+        state, _ = step(state, jnp.array([GO, GO]))
+    assert not env.deciding(state)[0] and env.can_terminate(state)[0]
+    assert env.active_agents(state)[0]
+    # The rule terminates it: 50 minutes of outage left outweighs 4 calls x 5 minutes.
+    _, actions = env.heuristic().act(env.heuristic().init(), state)
+    assert int(actions[0]) == TERMINATE

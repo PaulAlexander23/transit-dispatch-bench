@@ -1,12 +1,12 @@
 """Train dispatching heuristics in JAX, reading the env state.
 
 The Python references are `sim.first_come_first_served`,
-`sim.section_reservation` and `sim.route_setting`.
+`sim.section_reservation`, `sim.route_setting` and `sim.terminate_when_stuck`.
 """
 
 import jax.numpy as jnp
 
-from transit_bench.envs.train.sim import GO, NOT_STARTED, WAIT
+from transit_bench.envs.train.sim import GO, NOT_STARTED, TERMINATE, WAIT
 
 
 class FirstComeFirstServed:
@@ -89,3 +89,43 @@ class RouteSetting(SectionReservation):
         shared = jnp.asarray(env.infra.section_shared)[jnp.maximum(joining, 0)]
         wait = (joining >= 0) & shared & taken
         return carry, jnp.where(wait, WAIT, actions).astype(jnp.int32)
+
+
+class TerminateWhenStuck:
+    """`rule` (route setting by default), plus TERMINATE where waiting looks
+    dearer than the missed calls, and to break deadlocks.
+
+    `sim.terminate_when_stuck` in JAX: a train that can terminate does so if
+    its next block is closed and the outage's expected time left (observed,
+    or the mean outage length) times `factor` exceeds the penalty for its
+    missed calls; and
+    of the deadlocked trains that can terminate, the one missing fewest
+    calls (lowest index on a tie) terminates.
+    """
+
+    def __init__(self, env, rule=None, factor=2.0):
+        self.env, self.factor = env, factor
+        self.rule = rule if rule is not None else RouteSetting(env)
+
+    def init(self):
+        return self.rule.init()
+
+    def act(self, carry, state, key=None):
+        carry, actions = self.rule.act(carry, state, key)
+        env, c = self.env, self.env.config
+        T = env.n_trains
+        can = env.can_terminate(state)
+        b = jnp.maximum(env.next_block(state), 0)
+        closed = ~state.blocks.open[b]
+        if c.disruption.observe_remaining:
+            left = state.disruption.remaining[b]
+        else:
+            left = jnp.full(T, c.disruption.mean_seconds)
+        missed = env.missed_calls(state)
+        stuck = can & closed & (self.factor * left > 60 * c.terminate_penalty * missed)
+        actions = jnp.where(stuck, TERMINATE, actions)
+        dead = env.deadlocked(state) & can
+        score = jnp.where(dead, missed * T + jnp.arange(T), jnp.iinfo(jnp.int32).max)
+        pick = jnp.argmin(score)
+        actions = actions.at[pick].set(jnp.where(dead.any(), TERMINATE, actions[pick]))
+        return carry, actions.astype(jnp.int32)

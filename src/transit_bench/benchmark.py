@@ -43,10 +43,16 @@ def baselines(env_id, env):
     if family == "bus":
         out["always go"] = Constant(env, 0)
     if family == "train":
-        from transit_bench.envs.train.heuristic import FirstComeFirstServed, SectionReservation
+        from transit_bench.envs.train.heuristic import (
+            FirstComeFirstServed,
+            RouteSetting,
+            SectionReservation,
+        )
 
         out["first come first served"] = FirstComeFirstServed(env)
         out["section reservation"] = SectionReservation(env)
+        if env.n_actions == 3:  # the heuristic adds TERMINATE to route setting
+            out["route setting"] = RouteSetting(env)
     out["heuristic"] = env.heuristic()
     return out
 
@@ -71,11 +77,14 @@ def domain_metrics(env_id, env, rewards, info):
         delay = -np.asarray(rewards).sum(axis=0) / env.n_trains
         worst = np.sort(delay)[-max(1, len(delay) // 10) :]
         deadlocks = (info["deadlocked"].max(axis=0) > 0).mean()
-        return [
-            ("delay/train", f"{delay.mean():.2f} min"),
+        out = [
+            ("cost/train" if env.n_actions == 3 else "delay/train", f"{delay.mean():.2f} min"),
             ("CVaR10", f"{worst.mean():.2f} min"),
             ("deadlocks", f"{deadlocks:.3f}"),
         ]
+        if env.n_actions == 3:
+            out.append(("terminated/ep", f"{info['terminated'].sum(axis=0).mean():.2f}"))
+        return out
     return []
 
 

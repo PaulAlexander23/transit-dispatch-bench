@@ -31,12 +31,22 @@ from transit_bench.envs.train.sim import (
     HEAD_FIELDS,
     LOOKAHEAD,
     NOT_STARTED,
+    TERMINATE,
     WAIT,
     Exogenous,
     lognormal_params,
 )
 
-INFO_INT = ("entered", "arrived", "held", "blocked", "deadlocked", "finished")
+INFO_INT = (
+    "entered",
+    "arrived",
+    "held",
+    "blocked",
+    "terminated",
+    "missed",
+    "deadlocked",
+    "finished",
+)
 
 
 class TrainState(NamedTuple):
@@ -54,8 +64,9 @@ class TrainState(NamedTuple):
 class TrainEnv:
     """Train dispatching on blocks of track, as pure JAX functions.
 
-    `n_agents` trains each choose GO (0) or WAIT (1); only deciding trains'
-    choices take effect (`active_agents`). The observation is one block of
+    `n_agents` trains each choose GO (0) or WAIT (1), and TERMINATE (2) if
+    the config has a `terminate_penalty`; only deciding trains' choices,
+    and terminating trains', take effect (`active_agents`). The observation is one block of
     features per train (`per_agent_obs`), as `sim.TrainSim.observe`.
 
     With `shield=True` a safety shield vetoes any GO that route setting
@@ -77,7 +88,7 @@ class TrainEnv:
         self.infra = infra = build(c)
         self.n_trains = T = len(infra.route)
         self.n_agents = T
-        self.n_actions = 2
+        self.n_actions = 3 if c.terminate_penalty > 0 else 2
         self.per_agent_obs = True
         self.observation_nvec = None
         self.observation_size = T * (HEAD_FIELDS + BLOCK_FIELDS * LOOKAHEAD)
@@ -86,9 +97,12 @@ class TrainEnv:
         self.n_squarings = max(1, math.ceil(math.log2(T)))
 
     def heuristic(self):
-        """Route setting, the strongest of the rules (`heuristic`)."""
-        from transit_bench.envs.train.heuristic import RouteSetting
+        """Route setting, the strongest of the rules (`heuristic`), plus
+        `TerminateWhenStuck` when the config allows TERMINATE."""
+        from transit_bench.envs.train.heuristic import RouteSetting, TerminateWhenStuck
 
+        if self.config.terminate_penalty > 0:
+            return TerminateWhenStuck(self)
         return RouteSetting(self)
 
     # -- state ---------------------------------------------------------------
@@ -176,12 +190,35 @@ class TrainEnv:
         free = (state.occupant[safe] < 0) & state.blocks.open[safe]
         return self.ready(state) & (b >= 0) & free
 
+    def can_terminate(self, state):
+        """(trains,) bool: ready, not started or on a platform, not at the
+        last block (and the config allows TERMINATE)."""
+        if self.config.terminate_penalty <= 0:
+            return jnp.zeros(self.n_trains, bool)
+        station_of = jnp.asarray(self.infra.station_of, jnp.int32)
+        started = state.pos != NOT_STARTED
+        on_platform = station_of[jnp.maximum(self.here(state), 0)] >= 0
+        return self.ready(state) & (self.next_block(state) >= 0) & (~started | on_platform)
+
+    def here(self, state):
+        """(trains,) the block each train holds, or -1."""
+        route = jnp.asarray(self.infra.route, jnp.int32)
+        block = route[jnp.arange(self.n_trains), jnp.clip(state.pos, 0, route.shape[1] - 1)]
+        return jnp.where((state.pos != NOT_STARTED) & ~self.finished(state), block, -1)
+
+    def missed_calls(self, state):
+        """(trains,) calls each train would miss if it terminated now."""
+        calls_from = jnp.asarray(self.infra.calls_from, jnp.int32)
+        index = jnp.clip(state.pos + 1, 0, calls_from.shape[1] - 1)
+        return calls_from[jnp.arange(self.n_trains), index]
+
     def active_agents(self, state):
         """Trains whose action takes effect this step: the deciding ones
-        (less those the shield holds)."""
+        (less those the shield holds), and those that can terminate."""
+        deciding = self.deciding(state)
         if self.shield:
-            return self.deciding(state) & ~self.vetoed(state)
-        return self.deciding(state)
+            deciding = deciding & ~self.vetoed(state)
+        return deciding | self.can_terminate(state)
 
     def vetoed(self, state):
         """(trains,) bool: deciding trains route setting would hold."""
@@ -232,10 +269,16 @@ class TrainEnv:
         now = (state.t * c.step_seconds).astype(f)
         ready = self.ready(state)
         deciding = self.deciding(state)
+        terminate = self.can_terminate(state) & (actions == TERMINATE)
+        frozen = self.projected_delay(state, now) + 60 * c.terminate_penalty * self.missed_calls(
+            state
+        )
         nxt_block = self.next_block(state)
         B = self.n_blocks
         claimed = jnp.zeros(B, bool)
-        counts = {k: jnp.zeros((), jnp.int32) for k in ("entered", "arrived", "held", "blocked")}
+        keys = ("entered", "arrived", "held", "blocked", "terminated", "missed")
+        counts = {k: jnp.zeros((), jnp.int32) for k in keys}
+        missed = self.missed_calls(state)
         pos, remaining = state.pos, state.remaining
         occupant, arrival_delay = state.occupant, state.arrival_delay
         for i in range(self.n_trains):  # in index order: earlier trains first
@@ -243,12 +286,13 @@ class TrainEnv:
             safe = jnp.maximum(b, 0)
             p = pos[i]
             here = route[i, jnp.clip(p, 0, route.shape[1] - 1)]
+            stop = terminate[i]
             leave = ready[i] & (b < 0)
-            can = ready[i] & (b >= 0) & deciding[i] & ~claimed[safe]
+            can = ready[i] & (b >= 0) & deciding[i] & ~claimed[safe] & ~stop
             enter = can & (actions[i] == GO)
             held = can & (actions[i] != GO)
-            blocked = ready[i] & (b >= 0) & ~can
-            vacate = leave | (enter & (p != NOT_STARTED))
+            blocked = ready[i] & (b >= 0) & ~can & ~stop
+            vacate = leave | ((stop | enter) & (p != NOT_STARTED))
             occupant = occupant.at[jnp.where(vacate, here, B)].set(-1, mode="drop")
             occupant = occupant.at[jnp.where(enter, b, B)].set(i, mode="drop")
             claimed = claimed.at[jnp.where(enter, b, B)].set(True, mode="drop")
@@ -257,8 +301,11 @@ class TrainEnv:
             ticks = jnp.maximum(1, jnp.ceil(seconds / c.step_seconds - 1e-9).astype(jnp.int32))
             remaining = remaining.at[i].set(jnp.where(enter, ticks + dwell[i, new_p], remaining[i]))
             late = jnp.maximum(0.0, now - sched[i, route_len[i]])
-            arrival_delay = arrival_delay.at[i].set(jnp.where(leave, late, arrival_delay[i]))
-            pos = pos.at[i].set(jnp.where(leave, route_len[i], jnp.where(enter, p + 1, p)))
+            late = jnp.where(stop, frozen[i], late)
+            arrival_delay = arrival_delay.at[i].set(jnp.where(leave | stop, late, arrival_delay[i]))
+            pos = pos.at[i].set(jnp.where(leave | stop, route_len[i], jnp.where(enter, p + 1, p)))
+            counts["terminated"] += stop
+            counts["missed"] += jnp.where(stop, missed[i], 0)
             counts["entered"] += enter
             counts["arrived"] += leave
             counts["held"] += held
@@ -359,6 +406,8 @@ class TrainEnv:
                 jnp.minimum(self.projected_delay(state, now) / DELAY_SCALE, 1.0),
                 jnp.asarray(self.infra.express),
                 direction.astype(bool),
+                self.can_terminate(state),
+                jnp.where(finished, 0, self.missed_calls(state)).astype(f) / c.n_stations,
                 *section_fields,
             ],
             axis=1,
@@ -382,4 +431,4 @@ class TrainEnv:
         return jnp.concatenate([head, ahead.reshape(self.n_trains, -1)], axis=1).ravel()
 
 
-__all__ = ["GO", "WAIT", "TrainEnv", "TrainState"]
+__all__ = ["GO", "TERMINATE", "WAIT", "TrainEnv", "TrainState"]

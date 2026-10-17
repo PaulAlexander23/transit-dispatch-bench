@@ -101,6 +101,18 @@ Disruptions enter as data:
 
 Disruption responses add actions: short-turn (reverse at an intermediate
 station), cancel a service, reroute through an alternative block sequence.
+In the MILP, cancelling or truncating trip `i` makes its later operations
+optional: a binary `z_iq` per call `q` (1 if served), with every operation
+after an unserved call dropped from the blocking constraints, and the
+objective gains `Σ_iq c · (1 − z_iq)` for a penalty `c` per missed call
+(as in the rescheduling literature, e.g. Veelenturf et al. 2016). The env's
+TERMINATE action is this choice made online: end the trip at the current
+platform (or before departure), freeze the train's lateness and pay `c` for
+each call it misses. The decision is a stopping problem: terminate when the
+expected cost of waiting, for this train *and the ones queued behind it*,
+exceeds `c × missed calls`. Under Markov outages the expected time left is
+the mean whatever the elapsed time (memorylessness), so a rule needs only
+the mean; under semi-Markov ones the elapsed time is informative.
 
 ### Fleet
 

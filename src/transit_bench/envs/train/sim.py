@@ -23,6 +23,16 @@ Dynamics, in ticks of `step_seconds`:
   the tick. These synchronous rules make "deciding" exactly the set of
   trains whose action matters (`active_agents` in the JAX env).
 - No train enters its first block before its scheduled departure.
+- With `terminate_penalty` > 0 there is a third action, TERMINATE: a ready
+  train that has not started, or stands on a platform with blocks still
+  ahead, ends its trip there. It leaves the network at once (freeing its
+  block, which others can enter from the next tick), and its lateness is
+  frozen at its projected lateness then, plus `terminate_penalty` minutes
+  for each call it misses. Before departure this is a cancellation; at an
+  intermediate station it is the outbound half of a short-turn (the return
+  working needs vehicle circulation, which the env does not model). Such
+  a train *can terminate* and is active even if its next block is taken
+  or closed, which is when terminating is worth considering.
 
 Reward: minus the change in total *projected* lateness, in minutes. A
 train's projected lateness is how late it will be at its next scheduled
@@ -45,9 +55,9 @@ import numpy as np
 from transit_bench.core import disruption
 from transit_bench.envs.train.infra import PRESETS, TrainConfig, build
 
-GO, WAIT = 0, 1
+GO, WAIT, TERMINATE = 0, 1, 2
 NOT_STARTED = -1
-HEAD_FIELDS = 13
+HEAD_FIELDS = 15
 LOOKAHEAD = 4  # blocks ahead on the route in each train's observation
 BLOCK_FIELDS = 6
 DELAY_SCALE = 600.0  # seconds: observation scale for delays and times
@@ -128,6 +138,22 @@ class TrainSim:
         b = self.next_block(i)
         return self.ready(i) and b >= 0 and self.occupant[b] < 0 and self.block_open[b]
 
+    def can_terminate(self, i):
+        """Ready, not started or on a platform, and not at its last block."""
+        if self.config.terminate_penalty <= 0 or not self.ready(i) or self.next_block(i) < 0:
+            return False
+        return self.pos[i] == NOT_STARTED or self.infra.station_of[self.here(i)] >= 0
+
+    def here(self, i):
+        """The block train i holds, or -1."""
+        if self.pos[i] == NOT_STARTED or self.finished(i):
+            return -1
+        return int(self.infra.route[i][self.pos[i]])
+
+    def missed_calls(self, i):
+        """Calls train i would miss if it terminated now."""
+        return int(self.infra.calls_from[i][self.pos[i] + 1])
+
     def projected_delay(self, i, now):
         sched = self.infra.sched[i]
         if self.finished(i):
@@ -147,18 +173,22 @@ class TrainSim:
             out.append(self.occupant[b] if waiting else -1)
         return out
 
-    def deadlocked(self):
-        """Trains on a cycle of waits: each waits for a block the next holds."""
+    def deadlocked_trains(self):
+        """Per train, whether it is on a cycle of waits: each waits for a
+        block the next holds."""
         waits = self.waits_for()
-        stuck = 0
+        out = []
         for i in range(len(waits)):
             j = waits[i]
             for _ in range(len(waits)):
                 if j < 0 or j == i:
                     break
                 j = waits[j]
-            stuck += j == i
-        return stuck
+            out.append(j == i)
+        return out
+
+    def deadlocked(self):
+        return sum(self.deadlocked_trains())
 
     # -- dynamics ------------------------------------------------------------
 
@@ -168,13 +198,25 @@ class TrainSim:
         if exo is None:
             exo = self.draw()
         now = self.t * c.step_seconds
-        info = dict.fromkeys(("entered", "arrived", "held", "blocked"), 0)
+        keys = ("entered", "arrived", "held", "blocked", "terminated", "missed")
+        info = dict.fromkeys(keys, 0)
         T = len(self.pos)
         ready = [self.ready(i) for i in range(T)]
         deciding = [self.deciding(i) for i in range(T)]
+        can_terminate = [self.can_terminate(i) for i in range(T)]
         claimed = set()
         for i in range(T):
             if not ready[i]:
+                continue
+            if can_terminate[i] and int(actions[i]) == TERMINATE:
+                missed = self.missed_calls(i)
+                late = self.projected_delay(i, now)
+                if self.pos[i] != NOT_STARTED:
+                    self.occupant[self.here(i)] = -1
+                self.pos[i] = int(infra.route_len[i])
+                self.arrival_delay[i] = late + 60 * c.terminate_penalty * missed
+                info["terminated"] += 1
+                info["missed"] += missed
                 continue
             b = self.next_block(i)
             if b < 0:  # leave the network from the last block
@@ -222,7 +264,9 @@ class TrainSim:
 
         Head: not started, running (time left in its block), deciding,
         finished, progress along its route, time left in its block and
-        projected delay (over DELAY_SCALE, capped at 1), express, westbound;
+        projected delay (over DELAY_SCALE, capped at 1), express, westbound,
+        can terminate, and the calls it would miss if it did (over the
+        number of stations);
         then, for the next section it will enter: its next block is in it
         (it would enter the section now); a train going the other way is in
         it; one is deciding to enter it this tick ahead of this train in the
@@ -256,6 +300,8 @@ class TrainSim:
                 min(self.projected_delay(i, now) / DELAY_SCALE, 1.0),
                 float(infra.express[i]),
                 float(infra.direction[i]),
+                float(self.can_terminate(i)),
+                self.missed_calls(i) / self.config.n_stations if not self.finished(i) else 0.0,
             ]
             sec, d = target[i], infra.direction[i]
             inside = sec >= 0 and any(
@@ -400,4 +446,40 @@ def route_setting(sim):
         far = int(infra.far_platform[i][sim.pos[i] + 1])
         if far >= 0 and sim.occupant[far] >= 0:
             actions[i] = WAIT
+    return actions
+
+
+def terminate_when_stuck(sim, rule=route_setting, factor=2.0):
+    """`rule`, plus TERMINATE where waiting looks dearer than the missed calls.
+
+    A train that can terminate does so when its next block is closed and
+    `factor` x the outage's expected time left exceeds `terminate_penalty`
+    x the calls it would miss. The factor is there because waiting costs
+    more than the blocked train's own wait: the trains queued behind it
+    wait too. On `response`, factor 2 beats 1 (3.70 vs 3.80 minutes per
+    train) and larger factors change nothing (docs/plan.md, Phase 4).
+    The expected time left is the observed one if the config shows it,
+    else the mean outage length: exact for Markov (memoryless)
+    outages, whose time left does not depend on how long they have lasted,
+    and a rough guess for semi-Markov ones. It also breaks deadlocks: of the
+    deadlocked trains that can terminate, the one missing fewest calls
+    (lowest index on a tie) terminates; one per tick.
+    """
+    actions = list(rule(sim))
+    c = sim.config
+    T = len(sim.pos)
+    for i in range(T):
+        if not sim.can_terminate(i):
+            continue
+        b = sim.next_block(i)
+        if sim.block_open[b]:
+            continue
+        d = sim.disruption
+        left = d.remaining[b] if c.disruption.observe_remaining else c.disruption.mean_seconds
+        if factor * left > 60 * c.terminate_penalty * sim.missed_calls(i):
+            actions[i] = TERMINATE
+    stuck = sim.deadlocked_trains()
+    options = [(sim.missed_calls(i), i) for i in range(T) if stuck[i] and sim.can_terminate(i)]
+    if options:
+        actions[min(options)[1]] = TERMINATE
     return actions
