@@ -298,3 +298,26 @@ def test_rollout_and_mappo_run():
 def test_config_validation():
     with pytest.raises(ValueError):
         TrainConfig(single_track=True, passing_loops=True)
+
+
+def test_observation_shows_an_oncoming_rival_for_the_section():
+    from transit_bench.envs.train.sim import HEAD_FIELDS, LOOKAHEAD
+
+    c = replace(
+        PRESETS["single"],
+        n_stations=2,
+        trains_per_direction=1,
+        running_cv=0.0,
+        incident_probability=0.0,
+    )
+    sim = TrainSim(c)
+    sim.step([GO, GO])  # both enter their terminal platforms
+    while not (sim.deciding(0) and sim.deciding(1)):
+        sim.step([WAIT, WAIT])
+    width = HEAD_FIELDS + 4 * LOOKAHEAD
+    obs = sim.observe().reshape(2, width)
+    entering, inside, before, after = obs[:, 9], obs[:, 10], obs[:, 11], obs[:, 12]
+    assert list(entering) == [1, 1]
+    assert list(inside) == [0, 0]
+    assert list(before) == [0, 1]  # train 1 sees train 0 go first
+    assert list(after) == [1, 0]

@@ -88,6 +88,9 @@ class Infra(NamedTuple):
     sched: np.ndarray  # (trains, L + 1) float: scheduled entry seconds; [len] = arrival
     direction: np.ndarray  # (trains,) int: EAST or WEST
     express: np.ndarray  # (trains,) bool
+    # (trains, L + 1): at route index pos + 1, the next section the train
+    # will enter from outside it (-1 if none left).
+    next_section: np.ndarray
 
 
 def build(config: TrainConfig) -> Infra:
@@ -160,6 +163,15 @@ def build(config: TrainConfig) -> Infra:
         sched[i, len(steps)] = t
     direction = np.array([d for d, _, _ in trains])
     express = np.array([e for _, e, _ in trains])
+    next_section = np.full((T, L + 1), -1, np.int64)
+    for i in range(T):
+        for pos in range(-1, L):
+            here = section_of[route[i, pos]] if pos >= 0 else -1
+            for p in range(pos + 1, L):
+                sec = section_of[route[i, p]]
+                if sec >= 0 and sec != here:
+                    next_section[i, pos + 1] = sec
+                    break
     return Infra(
         n_blocks,
         station_of,
@@ -171,4 +183,5 @@ def build(config: TrainConfig) -> Infra:
         sched,
         direction,
         express,
+        next_section,
     )

@@ -263,6 +263,47 @@ class TrainEnv:
 
     # -- observation ---------------------------------------------------------
 
+    def joining(self, state):
+        """(trains,) the section each train is deciding to enter from outside, or -1."""
+        route = jnp.asarray(self.infra.route, jnp.int32)
+        section_of = jnp.asarray(self.infra.section_of, jnp.int32)
+        target = section_of[jnp.maximum(self.next_block(state), 0)]
+        here_block = route[jnp.arange(self.n_trains), jnp.clip(state.pos, 0, route.shape[1] - 1)]
+        here = jnp.where(state.pos != NOT_STARTED, section_of[here_block], -1)
+        joins = self.deciding(state) & (target >= 0) & (here != target)
+        return jnp.where(joins, target, -1)
+
+    def _section_fields(self, state):
+        """For each train's next section: whether its next block enters it,
+        an oncoming train inside it, and oncoming trains deciding to enter
+        it before and after this one."""
+        infra = self.infra
+        S, T = self.n_sections, self.n_trains
+        direction = jnp.asarray(infra.direction, jnp.int32)
+        section_of = jnp.asarray(infra.section_of, jnp.int32)
+        next_section = jnp.asarray(infra.next_section, jnp.int32)
+        index = jnp.minimum(state.pos + 1, next_section.shape[1] - 1)
+        target = jnp.where(self.finished(state), -1, next_section[jnp.arange(T), index])
+        holder = state.occupant
+        in_section = (holder >= 0) & (section_of >= 0)
+        rows = jnp.where(in_section, section_of, S)
+        cols = direction[jnp.maximum(holder, 0)]
+        occupied = jnp.zeros((S + 1, 2), bool).at[rows, cols].max(in_section)
+        safe = jnp.where(target >= 0, target, S)
+        inside = occupied[safe, 1 - direction] & (target >= 0)
+        joining = self.joining(state)
+        rival = (
+            (joining[None, :] == target[:, None])
+            & (target[:, None] >= 0)
+            & (direction[None, :] != direction[:, None])
+        )  # [i, j]: j is an oncoming train joining i's next section
+        order = jnp.arange(T)
+        before = (rival & (order[None, :] < order[:, None])).any(axis=1)
+        after = (rival & (order[None, :] > order[:, None])).any(axis=1)
+        b = self.next_block(state)
+        now_entering = (target >= 0) & (b >= 0) & (section_of[jnp.maximum(b, 0)] == target)
+        return now_entering, inside, before, after
+
     def observe(self, state):
         c = self.config
         route, route_len, _, _, _, direction = self._arrays()
@@ -270,6 +311,7 @@ class TrainEnv:
         now = (state.t * c.step_seconds).astype(f)
         started = state.pos != NOT_STARTED
         finished = self.finished(state)
+        section_fields = self._section_fields(state)
         head = jnp.stack(
             [
                 ~started,
@@ -281,6 +323,7 @@ class TrainEnv:
                 jnp.minimum(self.projected_delay(state, now) / DELAY_SCALE, 1.0),
                 jnp.asarray(self.infra.express),
                 direction.astype(bool),
+                *section_fields,
             ],
             axis=1,
         ).astype(jnp.float32)

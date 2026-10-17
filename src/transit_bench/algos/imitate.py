@@ -23,17 +23,26 @@ from transit_bench.core.vec import make_vec_env
 
 
 def collect(env, n_samples, gamma=0.99, seed=0, heuristic=None):
-    """Run the heuristic for whole episodes: observations, actions, returns.
+    """Run the heuristic: observations, actions, returns and active agents.
 
-    One episode in each of ceil(n_samples / max_steps) envs, all in one
-    `jit`; the first `n_samples` (observation, action, discounted return)
-    triples are kept. Returns use `env`'s reward, so pass the shaped env the
-    PPO will train on.
+    max_steps steps in each of ceil(n_samples / max_steps) envs, all in one
+    `jit`; the first `n_samples` (observation, action, discounted return,
+    active) tuples are kept. An env whose episode ends early starts another,
+    and returns stop at episode ends. Returns use `env`'s reward, so pass
+    the shaped env the PPO will train on. `active` marks the agents whose
+    action took effect (`env.active_agents`, all if the env has none), so
+    cloning can ignore the rest, as PPO does.
     """
     heuristic = heuristic or env.heuristic()
     n_envs = math.ceil(n_samples / env.max_steps)
     reset, step = make_vec_env(env, n_envs)
     act = jax.vmap(heuristic.act)
+    if hasattr(env, "active_agents"):
+        active_agents = jax.vmap(env.active_agents)
+    else:
+
+        def active_agents(states):
+            return jnp.ones((n_envs, env.n_agents), bool)
 
     @jax.jit
     def run(key):
@@ -44,48 +53,58 @@ def collect(env, n_samples, gamma=0.99, seed=0, heuristic=None):
         def body(loop, key):
             vec_state, carry, obs = loop
             carry, action = act(carry, vec_state.env, jax.random.split(key, n_envs))
+            active = active_agents(vec_state.env)
             vec_state, ts = step(vec_state, action)
-            return (vec_state, carry, ts.observation), (obs, action, ts.reward)
+            out = (obs, action, active, ts.reward, ts.done)
+            return (vec_state, carry, ts.observation), out
 
         keys = jax.random.split(k_run, env.max_steps)
-        _, (obs, actions, rewards) = jax.lax.scan(body, (vec_state, carry, ts.observation), keys)
+        init = (vec_state, carry, ts.observation)
+        _, (obs, actions, active, rewards, dones) = jax.lax.scan(body, init, keys)
 
-        def back(g, reward):
-            g = reward + gamma * g
+        def back(g, step):
+            reward, done = step
+            g = reward + gamma * g * (1.0 - done)
             return g, g
 
-        _, returns = jax.lax.scan(back, jnp.zeros(n_envs), rewards, reverse=True)
+        _, returns = jax.lax.scan(back, jnp.zeros(n_envs), (rewards, dones), reverse=True)
 
         # (steps, envs, ...) -> episode by episode, as the Python collector
         def flat(x):
             return jnp.swapaxes(x, 0, 1).reshape(n_envs * env.max_steps, *x.shape[2:])
 
-        return flat(obs), flat(actions), flat(returns)
+        return flat(obs), flat(actions), flat(returns), flat(active)
 
-    observations, actions, returns = run(jax.random.key(seed))
+    observations, actions, returns, active = run(jax.random.key(seed))
     n = n_samples
     return (
         np.asarray(observations[:n]),
         np.asarray(actions[:n]),
         np.asarray(returns[:n], np.float32),
+        np.asarray(active[:n]),
     )
 
 
 def pretrain(params, observations, actions, returns, n_agents, epochs=15, batch_size=256, lr=1e-3,
-             seed=0):  # fmt: skip
-    """Fit `params` to the data; return (params, final epoch's log-likelihood, value loss)."""
+             seed=0, active=None):  # fmt: skip
+    """Fit `params` to the data; return (params, final epoch's log-likelihood, value loss).
+
+    With `active` (samples, n_agents) only the active agents' actions are
+    fitted; the log-likelihood is per sample, summed over those agents.
+    """
     optimizer = optax.adam(lr)
     n_batches = len(actions) // batch_size
     data = (
         jnp.asarray(observations, jnp.float32),
         jnp.asarray(actions, jnp.int32),
         jnp.asarray(returns, jnp.float32),
+        jnp.ones(np.shape(actions), bool) if active is None else jnp.asarray(active, bool),
     )
 
     def loss_fn(params, batch):
-        obs, act, ret = batch
+        obs, act, ret, active = batch
         logits, value = policy(params, obs, n_agents)
-        log_likelihood = log_prob(logits, act).mean()
+        log_likelihood = log_prob(logits, act, active).mean()
         value_loss = ((value - ret) ** 2).mean()
         return -log_likelihood + 0.5 * value_loss, (log_likelihood, value_loss)
 
@@ -117,9 +136,16 @@ def warm_start(env, config: PPOConfig, n_samples=100_000, epochs=15, seed=0):
 
     Returns (params, {"log_likelihood", "value_loss"}).
     """
-    observations, actions, returns = collect(env, n_samples, config.gamma, seed)
+    observations, actions, returns, active = collect(env, n_samples, config.gamma, seed)
     params = init_params(jax.random.key(seed), env, config)
     params, log_likelihood, value_loss = pretrain(
-        params, observations, actions, returns, env.n_agents, epochs=epochs, seed=seed
+        params,
+        observations,
+        actions,
+        returns,
+        env.n_agents,
+        epochs=epochs,
+        seed=seed,
+        active=active,
     )
     return params, {"log_likelihood": log_likelihood, "value_loss": value_loss}

@@ -262,21 +262,82 @@ A job shop with blocking (see [formulation.md](formulation.md#train)). The
 action is an ordering choice at a conflict: which train enters a contested
 block first. Presets, one hard feature at a time:
 
-- [ ] `line`: double track, stations, track blocks (capacity 1), timetable.
-- [ ] `passing`: passing loops, mixed fast and slow trains (overtaking).
-- [ ] `single`: single track with crossing points; deadlock becomes possible.
+- [x] `line`: double track, stations, track blocks (capacity 1), timetable.
+- [x] `passing`: passing loops, mixed fast and slow trains (overtaking).
+- [x] `single`: single track with crossing points; deadlock becomes possible.
       Detect it in JAX by repeated squaring of the wait-for matrix.
 - [ ] `junction`: a small network with route choice.
-- [ ] Heuristics: keep to timetable with first-come-first-served at
+- [x] Heuristics: keep to timetable with first-come-first-served at
       conflicts; prioritised replanning (the Flatland 2020 winners' approach),
       so RL is compared with a planner, not only a rule.
-- [ ] Metrics: total and weighted delay, passengers served, deadlocks,
-      conflicts resolved.
+      Done: first come, first served, and *section reservation* (never enter
+      a section against an oncoming train), the interlocking principle
+      single-track lines run on. Prioritised replanning is still to do
+      (backlog).
+- [x] Metrics: total and weighted delay, passengers served, deadlocks,
+      conflicts resolved. Done: delay per train, deadlock rate, trains
+      finished, held and blocked counts. Passengers are not modelled yet.
 - [ ] Hindsight bound on small presets: solve the alternative-graph MILP
       after the episode with all disruptions known (e.g. HiGHS via `highspy`;
       check the dependency first). Report each policy's gap to it.
 - [ ] Optional: load a few small DISPLIB instances as test networks.
 
+**Result.** Env built and verified; RL matches the rules where they are
+optimal and copies section reservation, but does not yet improve on it.
+
+- **Model** (`envs/train/`). `infra.build` lays out stations and
+  sections of blocks (double or single track, optional loop platforms),
+  routes and a timetable with 5% slack. Each tick a *ready* train with a
+  free next block is *deciding*: GO enters, WAIT stays. Blocks hold one
+  train, and a train holds its block until it enters the next (blocking).
+  Running times are lognormal; incidents (2% of block entries) add
+  exponential delays (mean 2 min), the primary delays. Reward is minus
+  the change in total projected lateness, so the return telescopes to
+  minus total arrival delay (tested exactly). Deadlock detection in JAX:
+  ⌈log₂ N⌉ boolean matrix squarings of the wait-for relation (tested on a
+  constructed head-on cycle with a third train queued behind).
+- **Design fix found by testing the heuristic: synchronous ticks.** At
+  first a train with one tick left became ready during the tick and acted
+  on an action chosen before it was deciding. So two trains could enter
+  a single-track section from both ends, and section reservation behaved
+  exactly like first come, first served (20% deadlocks). Now ready and
+  deciding are judged once at the start of the tick, a block freed during
+  a tick opens on the next one (like a signal clearing), and countdowns
+  happen at the end. `active_agents` is then exactly the set of trains
+  whose action matters.
+- **Baselines** (`scripts/train_baselines.py`, 512 episodes; delay per
+  train in minutes, deadlock rate):
+
+  | Preset | Random | FCFS | Reservation | MAPPO 5M | Clone | Clone + MAPPO 5M |
+  |---|---|---|---|---|---|---|
+  | `line` | 2.97 / 0 | 0.86 / 0 | 0.86 / 0 | 0.85 / 0 | | |
+  | `passing` | 4.27 / 0 | 2.16 / 0 | 2.16 / 0 | 2.15 / 0 | 2.15 / 0 | 2.15 / 0 |
+  | `single` | 9.57 / 0.39 | 4.92 / 0.22 | **1.48 / 0.025** | 4.68 / 0.20 | 1.63 / 0.029 | 1.87 / 0.041 |
+
+  MAPPO trains at 175–235k steps/s (5M steps in under 30 s).
+- **What was learned.**
+  - **From scratch, MAPPO finds first come, first served and never
+    discovers deadlock avoidance.** A deadlock is rare and catastrophic,
+    and its cost arrives long after the decision that caused it, which
+    16-step rollouts with GAE cannot credit. This is the Flatland lesson
+    in miniature.
+  - **Cloning the rule failed at first, for two reasons, each found by
+    measuring accuracy on the rare WAIT decisions (0.09% of agent-actions)
+    rather than the average log-likelihood (−0.008, which looked
+    perfect).** (1) The observation lacked the conflict: an oncoming train
+    waiting at the far end of a section stands on a platform that is not on
+    this train's route. Added fields: next section's oncoming occupant, and
+    oncoming trains about to enter it before or after this one. (2) "An
+    oncoming train is in my next section" was also true for trains about
+    to move onto a platform, not into the section, so a field for "my next
+    block enters that section" was needed. After both, WAIT accuracy went
+    from 60% to 100% and the clone matches the rule. Masking inactive
+    agents out of the imitation loss (as in PPO) did not help by itself.
+  - Fine-tuning the clone with PPO for 5M steps drifts slightly worse
+    (1.63 → 1.87 min, deadlocks 2.9% → 4.1%): the same credit problem.
+  - On `passing`, no rule or learner beats FCFS yet. Holding a stopping
+    train in a loop for a following express is the decision that could
+    help, and it needs look-ahead along the route behind the train.
 ### Phase 4: disruptions
 
 - [ ] Core disruption process: edge outages (`κ_e = 0`), slow running
@@ -312,6 +373,12 @@ block first. Presets, one hard feature at a time:
 - Graph-network policies (the old repo has a GNN experiment in `scripts/gnn.py`).
   Needed for rail generalisation: train on random networks (Flatland-style
   generator), test on unseen ones and on DISPLIB networks.
+- Train env: prioritised replanning baseline (space-time reservations
+  along each train's route, replanned on delay); a look-behind observation
+  (the next train behind on the same track, its speed and delay) for
+  overtaking on `passing`; passengers and connections; longer PPO runs and
+  longer rollouts for deadlock credit; a deadlock penalty or early
+  termination as a named shaping.
 - Adversarial disruptions: a second agent picks which edge to block
   (attacker–defender), for a worst-case robustness score.
 - RL proposes, a solver repairs: RL picks train orderings and a replanner

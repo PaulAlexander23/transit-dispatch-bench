@@ -12,7 +12,8 @@ from transit_bench.envs.elevator.heuristic import CollectivePolicy
 
 def test_collect_records_whole_heuristic_episodes():
     env = ElevatorEnv("multi", reward_shaping=True, max_steps=50)
-    observations, actions, returns = collect(env, 120, gamma=0.9)
+    observations, actions, returns, active = collect(env, 120, gamma=0.9)
+    assert active.shape == (120, 4) and active.all()  # the elevator has no mask
     assert observations.shape == (120, env.observation_size)
     assert actions.shape == (120, 4)
     assert returns.shape == (120,)
@@ -24,7 +25,7 @@ def test_collect_records_whole_heuristic_episodes():
 def test_collected_returns_match_the_python_heuristic_in_distribution():
     """Mean unshaped return of collected episodes against the Python heuristic."""
     env = ElevatorEnv("multi", max_steps=100)
-    _, _, returns = collect(env, 100 * 64, gamma=1.0)
+    _, _, returns, _ = collect(env, 100 * 64, gamma=1.0)
     episode_returns = returns.reshape(64, 100)[:, 0]  # return from the first step
     python = ElevatorGymEnv("multi", obs_type="custom", max_steps=100)
     policy = CollectivePolicy("multi")
@@ -45,7 +46,7 @@ def test_collected_returns_match_the_python_heuristic_in_distribution():
 def test_pretrain_fits_the_heuristic():
     env = ElevatorEnv("multi", reward_shaping=True)
     config = PPOConfig(net_arch=(32, 32))
-    observations, actions, returns = collect(env, 2048)
+    observations, actions, returns, _ = collect(env, 2048)
     params = init_params(jax.random.key(0), env, config)
     _, before, _ = pretrain(params, observations, actions, returns, 4, epochs=1, lr=0.0)
     _, after, _ = pretrain(params, observations, actions, returns, 4, epochs=5)
@@ -62,3 +63,15 @@ def test_warm_start_feeds_ppo():
     )
     assert history[0]["timesteps"] == 0  # the warm start's own eval comes first
     assert len(history) == 2  # the first update is compilation, so not evaluated
+
+
+def test_collect_stops_returns_at_episode_ends_and_marks_active_agents():
+    from transit_bench.envs.train import TrainEnv
+
+    env = TrainEnv("line")
+    _, _, returns, active = collect(env, env.max_steps, gamma=1.0)
+    # One env: the first episode ends when every train arrives, well inside
+    # max_steps; its first-step return is minus its total delay in minutes,
+    # whatever the next episode does.
+    assert active.any() and not active.all()
+    assert returns[0] <= 0

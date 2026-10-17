@@ -46,7 +46,7 @@ from transit_bench.envs.train.infra import PRESETS, TrainConfig, build
 
 GO, WAIT = 0, 1
 NOT_STARTED = -1
-HEAD_FIELDS = 9
+HEAD_FIELDS = 13
 LOOKAHEAD = 4  # blocks ahead on the route in each train's observation
 BLOCK_FIELDS = 4
 DELAY_SCALE = 600.0  # seconds: observation scale for delays and times
@@ -216,14 +216,25 @@ class TrainSim:
 
         Head: not started, running (time left in its block), deciding,
         finished, progress along its route, time left in its block and
-        projected delay (over DELAY_SCALE, capped at 1), express, westbound.
+        projected delay (over DELAY_SCALE, capped at 1), express, westbound;
+        then, for the next section it will enter: its next block is in it
+        (it would enter the section now); a train going the other way is in
+        it; one is deciding to enter it this tick ahead of this train in the
+        acting order; one is deciding to enter it after.
         Then for each of the next LOOKAHEAD blocks on its route: on the
         route, occupied, occupied by a train going the same way, open.
+
+        The section fields expose the local conflict a single-track
+        dispatcher must resolve: an oncoming train waiting at the far end of
+        the section stands on a platform that is not on this train's route.
         """
         infra = self.infra
         now = self.t * self.config.step_seconds
+        T = len(self.pos)
+        target = self._next_sections()
+        joining = self._joining()
         out = []
-        for i in range(len(self.pos)):
+        for i in range(T):
             n = int(infra.route_len[i])
             started = self.pos[i] != NOT_STARTED
             head = [
@@ -237,6 +248,18 @@ class TrainSim:
                 float(infra.express[i]),
                 float(infra.direction[i]),
             ]
+            sec, d = target[i], infra.direction[i]
+            inside = sec >= 0 and any(
+                j >= 0 and infra.section_of[blk] == sec and infra.direction[j] != d
+                for blk, j in enumerate(self.occupant)
+            )
+            rivals = [
+                j for j in range(T) if sec >= 0 and joining[j] == sec and infra.direction[j] != d
+            ]
+            b = self.next_block(i) if not self.finished(i) else -1
+            now_entering = sec >= 0 and b >= 0 and infra.section_of[b] == sec
+            head += [float(now_entering), float(inside), float(any(j < i for j in rivals))]
+            head += [float(any(j > i for j in rivals))]
             ahead = []
             for k in range(1, LOOKAHEAD + 1):
                 p = self.pos[i] + k
@@ -249,6 +272,27 @@ class TrainSim:
                     ahead += [0.0, 0.0, 0.0, 0.0]
             out.append(head + ahead)
         return np.array(out, dtype=np.float32).ravel()
+
+    def _next_sections(self):
+        """Per train, the next section it will enter from outside (-1 if none)."""
+        table = self.infra.next_section
+        width = table.shape[1]
+        return [int(table[i][p + 1]) if p + 1 < width else -1 for i, p in enumerate(self.pos)]
+
+    def _joining(self):
+        """Per train, the section it is deciding to enter from outside, or -1."""
+        infra = self.infra
+        out = []
+        for i in range(len(self.pos)):
+            if not self.deciding(i):
+                out.append(-1)
+                continue
+            sec = int(infra.section_of[self.next_block(i)])
+            here = int(infra.route[i][self.pos[i]]) if self.pos[i] != NOT_STARTED else -1
+            if sec >= 0 and here >= 0 and infra.section_of[here] == sec:
+                sec = -1  # already inside
+            out.append(sec)
+        return out
 
 
 # -- heuristics ----------------------------------------------------------------
