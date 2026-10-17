@@ -203,12 +203,58 @@ its own state layout.
 
 ### Phase 2: bus loop
 
-- [ ] Env: buses on a loop of stops, stochastic travel times, passenger
+- [x] Env: buses on a loop of stops, stochastic travel times, passenger
       arrivals per stop; action = holding time at a stop (discrete).
-- [ ] Heuristic: headway-based holding (hold to target headway).
-- [ ] Metrics: mean wait, headway variance, bunching rate.
-- [ ] Presets: few stops/buses → realistic route; time-varying demand.
-- [ ] Python reference + parity tests; PPO/MAPPO results vs heuristic.
+      Holding is a per-tick go/hold choice for a *deciding* bus (nobody
+      left to drop off or pick up); other buses' actions are ignored.
+- [x] Heuristic: headway-based holding (hold to target headway).
+- [x] Metrics: mean wait, headway variance, bunching rate.
+- [x] Presets: few stops/buses → realistic route; time-varying demand.
+      `loop → noisy → busy → peak → full`.
+- [x] Python reference + parity tests; PPO/MAPPO results vs heuristic.
+
+**Result.** Env built and verified; RL does not beat the heuristic yet.
+
+- **Model** (`envs/bus/`, maths in [formulation.md](formulation.md#bus)).
+  10 s ticks; boarding 2 s and alighting 1 s per passenger, which gives the
+  bunching feedback. Running times are lognormal, rounded up to whole ticks
+  so no float accumulates. Reward is minus passenger-minutes (waiting plus
+  on board) over the number of stops. The target headway is the
+  steady-state fixed point `H = Sτ / (B − Sλ(α+β))`. Random draws are an
+  explicit `Exogenous` per step (Powell's `W_{t+1}`), so the JAX env replays
+  Python's draws: exact parity on every preset, under random and heuristic
+  actions. Edges carry `core.network.EdgeState` (open, speed); a closed
+  edge already holds buses (tested), which phase 4 builds on.
+- **Bugs caught by parity.** In JAX, `int32 / int32` gives float32 even
+  with x64 on, and `sum` widens int32 to int64 under x64. Both now cast
+  explicitly.
+- **Baselines** (`scripts/bus_baselines.py`, 256 episodes, return / mean
+  wait / headway CV / bunching rate):
+
+  | Preset | Random | Always go | Holding | MAPPO 5M | MAPPO + BC 5M |
+  |---|---|---|---|---|---|
+  | `noisy` | −668 / 239 s / 0.79 / 0.13 | −605 / 219 s / 0.78 / 0.15 | **−594** / 166 s / 0.46 / 0 | −605 (= always go) | −597 / 172 s / 0.50 / 0 |
+  | `full` | −1066 / 257 s / 0.69 / 0.08 | −986 / 227 s / 0.71 / 0.11 | −986 / 180 s / 0.44 / 0 | −1806 (holds forever) | **−982** / 180 s / 0.44 / 0 |
+
+- **What was learned.**
+  - Holding evens headways (CV 0.78 → 0.46, no bunching) and cuts waits
+    by 25%, but saves only about 2% of total passenger time. The time it
+    saves at stops is spent on board. On `full` it ties with always-go.
+  - **MAPPO from scratch converges to never holding.** A hold costs
+    in-vehicle minutes immediately, while the benefit (less bunching) is
+    delayed and spread over many passengers. P(hold | deciding) went to
+    0.000. On `full` the greedy policy even held forever.
+  - Masking inactive agents out of the PPO loss (`active_agents`, added
+    to the PPO port for envs with sparse decisions) did not change this.
+    It is right in principle and is now in place for rail.
+  - **Imitation then fine-tuning** reproduces the heuristic (log-likelihood
+    ≈ 0) and keeps it, but does not improve on it in 5M steps (~15 s at
+    370k steps/s on `noisy`).
+- **Backlog from this phase:** a two-way headway heuristic (balance the
+  gaps ahead and behind); a named `headway` shaping (penalise uneven
+  departures, as much of the bus-holding literature does); a hold
+  *duration* action at the decision point (semi-MDP), so one decision
+  covers a whole hold; longer runs.
 
 ### Phase 3: train network
 

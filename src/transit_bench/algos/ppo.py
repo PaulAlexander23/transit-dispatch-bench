@@ -188,15 +188,25 @@ def policy(params, obs, n_agents):
     return logits, mlp(params["vf"], obs)[..., 0]
 
 
-def log_prob(logits, actions):
-    """Log-probability of a MultiDiscrete action: the sum over agents."""
+def log_prob(logits, actions, active=None):
+    """Log-probability of a MultiDiscrete action: the sum over agents.
+
+    `active` (..., n_agents) bool leaves out agents whose action had no
+    effect this step, so they add nothing to the policy gradient.
+    """
     log_p = jax.nn.log_softmax(logits)
-    return jnp.take_along_axis(log_p, actions[..., None], axis=-1)[..., 0].sum(axis=-1)
+    per_agent = jnp.take_along_axis(log_p, actions[..., None], axis=-1)[..., 0]
+    if active is not None:
+        per_agent = jnp.where(active, per_agent, 0.0)
+    return per_agent.sum(axis=-1)
 
 
-def entropy(logits):
+def entropy(logits, active=None):
     log_p = jax.nn.log_softmax(logits)
-    return -(jnp.exp(log_p) * log_p).sum(axis=-1).sum(axis=-1)
+    per_agent = -(jnp.exp(log_p) * log_p).sum(axis=-1)
+    if active is not None:
+        per_agent = jnp.where(active, per_agent, 0.0)
+    return per_agent.sum(axis=-1)
 
 
 # -- training ------------------------------------------------------------------
@@ -213,6 +223,7 @@ class Runner(NamedTuple):
 class Rollout(NamedTuple):
     obs: jax.Array
     actions: jax.Array
+    active: jax.Array  # (n_agents,) bool per env: whose action took effect
     log_probs: jax.Array
     values: jax.Array
     rewards: jax.Array
@@ -230,6 +241,12 @@ def make_train(env, config: PPOConfig):
     """(init, update): init(key) -> Runner; update(runner) -> (runner, metrics).
 
     `update` is one rollout of n_envs x n_steps plus the PPO epochs; jit it.
+
+    If the env has `active_agents(state) -> (n_agents,) bool` (agents whose
+    action takes effect this step, e.g. buses at a decision point), only
+    those agents' log-probabilities and entropy enter the loss. Without it
+    an agent that acts once every twenty steps contributes nineteen steps of
+    pure noise to the policy gradient.
     """
     batch = config.n_envs * config.n_steps
     if batch % config.batch_size:
@@ -239,6 +256,12 @@ def make_train(env, config: PPOConfig):
     features = make_features(env)
     vec_reset, vec_step = make_vec_env(env, config.n_envs)
     optimizer = make_optimizer(config)
+    if hasattr(env, "active_agents"):
+        active_agents = jax.vmap(env.active_agents)
+    else:
+
+        def active_agents(states):
+            return jnp.ones((config.n_envs, n_agents), bool)
 
     def init(key, params=None):
         """`params` starts from given weights (e.g. a warm start) instead of fresh ones."""
@@ -254,6 +277,7 @@ def make_train(env, config: PPOConfig):
         key, k_act = jax.random.split(key)
         logits, value = policy(params, features(obs), n_agents)
         actions = jax.random.categorical(k_act, logits)
+        active = active_agents(vec_state.env)
         vec_state, ts = vec_step(vec_state, actions)
         next_obs, reward, done, info = ts.observation, ts.reward, ts.done, ts.info
         # Episodes only end at the time limit, so bootstrap through it, as
@@ -269,7 +293,7 @@ def make_train(env, config: PPOConfig):
             ),
             lambda: jnp.zeros_like(reward),
         )
-        step = Rollout(obs, actions, log_prob(logits, actions), value, reward, done)
+        step = Rollout(obs, actions, active, log_prob(logits, actions, active), value, reward, done)
         metrics = {
             "episode_return": info["episode_return"],
             "episode_done": done,
@@ -294,14 +318,14 @@ def make_train(env, config: PPOConfig):
         return adv, adv + rollout.values
 
     def loss_fn(params, mb):
-        obs, actions, old_log_probs, adv, returns = mb
+        obs, actions, active, old_log_probs, adv, returns = mb
         logits, value = policy(params, features(obs), n_agents)
-        ratio = jnp.exp(log_prob(logits, actions) - old_log_probs)
+        ratio = jnp.exp(log_prob(logits, actions, active) - old_log_probs)
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
         clipped = jnp.clip(ratio, 1 - config.clip_range, 1 + config.clip_range)
         policy_loss = -jnp.minimum(ratio * adv, clipped * adv).mean()
         value_loss = ((returns - value) ** 2).mean()
-        entropy_loss = -entropy(logits).mean()
+        entropy_loss = -entropy(logits, active).mean()
         loss = policy_loss + config.ent_coef * entropy_loss + config.vf_coef * value_loss
         clip_fraction = (jnp.abs(ratio - 1) > config.clip_range).mean()
         return loss, (policy_loss, value_loss, clip_fraction)
@@ -312,7 +336,7 @@ def make_train(env, config: PPOConfig):
         adv, returns = advantages(rollout, last_value)
         flat = jax.tree.map(
             lambda x: x.reshape(batch, *x.shape[2:]),
-            (rollout.obs, rollout.actions, rollout.log_probs, adv, returns),
+            (rollout.obs, rollout.actions, rollout.active, rollout.log_probs, adv, returns),
         )
 
         def epoch(carry, key):

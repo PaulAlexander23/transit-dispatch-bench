@@ -168,6 +168,10 @@ class BusEnv:
         boardable = jnp.minimum(space, state.waiting[state.stop].sum(axis=1))
         return state.at_stop & (alightable == 0) & (boardable == 0)
 
+    def active_agents(self, state):
+        """Buses whose action takes effect this step: the deciding ones."""
+        return self.deciding(state)
+
     def _bus(self, state, b, action, noise, now, info):
         """One bus's turn, as the body of `sim.BusSim.step`'s loop."""
         c = self.config

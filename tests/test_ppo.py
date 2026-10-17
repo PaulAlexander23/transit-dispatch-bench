@@ -205,3 +205,13 @@ def test_ppo_params_do_not_transfer():
     env = ElevatorEnv("full")
     with pytest.raises(ValueError, match="mappo"):
         transfer(init_params(jax.random.key(0), env, PPOConfig()), env, PPOConfig(), None)
+
+
+def test_inactive_agents_add_nothing_to_log_prob_or_entropy():
+    logits = jnp.array([[[0.0, 0.0, 0.0], [0.0, -1e9, -1e9]]])
+    actions = jnp.array([[2, 0]])
+    active = jnp.array([[False, True]])
+    assert float(log_prob(logits, actions, active)[0]) == pytest.approx(0.0)
+    assert float(entropy(logits, active)[0]) == pytest.approx(0.0)
+    active = jnp.array([[True, False]])
+    assert float(log_prob(logits, actions, active)[0]) == pytest.approx(np.log(1 / 3))
