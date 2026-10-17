@@ -57,6 +57,7 @@ from transit_bench.envs.elevator.gym_env import (
 from transit_bench.envs.elevator.sim import (
     _DAY_KEYFRAMES,
     _PROFILE_WEIGHTS,
+    DOOR_SNAP,
     DOORS,
     DOWN,
     IDLE,
@@ -441,8 +442,12 @@ class ElevatorEnv:
         moving = ~door & ~at_rest
         position = jnp.where(arrive, target, state.position + _rounded(sign * travelled))
         velocity = jnp.where(arrive, 0.0, sign * new_speed)
+        # Snapped to zero near the end, as sim._count_down: float32 would
+        # otherwise leave the doors open for one step too many.
+        timer = jnp.maximum(state.door_timer - dt, 0.0)
+        timer = jnp.where(timer < DOOR_SNAP * dt, 0.0, timer).astype(f)
         return state._replace(
-            door_timer=jnp.where(door, jnp.maximum(state.door_timer - dt, 0.0), state.door_timer),
+            door_timer=jnp.where(door, timer, state.door_timer),
             position=jnp.where(moving, position, state.position),
             velocity=jnp.where(moving, velocity, state.velocity).astype(f),
         )

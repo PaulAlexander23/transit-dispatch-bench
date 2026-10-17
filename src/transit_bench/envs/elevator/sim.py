@@ -49,6 +49,8 @@ _DAY_KEYFRAMES = (
     (1.0, _PROFILE_WEIGHTS["down_peak"]),
 )
 
+# A door timer this fraction of a substep from zero counts as zero.
+DOOR_SNAP = 1e-3
 # Lift status, as reported in observations.
 IDLE, MOVING, DOORS = 0, 1, 2
 # Actions per lift. SERVE opens the doors for everyone; with hall calls it is
@@ -275,7 +277,7 @@ class ElevatorSim:
         """Advance one lift by one substep: doors, then a bang-bang profile."""
         dt = self._dt
         if lift.door_timer > 0:
-            lift.door_timer = max(lift.door_timer - dt, 0.0)
+            lift.door_timer = _count_down(lift.door_timer, dt)
             return
         distance = lift.target - lift.position
         if distance == 0 and lift.velocity == 0:
@@ -322,6 +324,20 @@ class ElevatorSim:
             waiting = " ".join(str(d) for d in reversed(state.floor_queues[floor]))
             lines.append(f"{floor:3d} " + "  ".join(row) + " | " + waiting)
         return "\n".join(lines)
+
+
+def _count_down(timer, dt):
+    """A timer one substep later, snapped to zero within a thousandth of `dt`.
+
+    door_time / dt substeps should empty it exactly, but dt (0.1 s) is not
+    exact in binary: in float32 four seconds less forty 0.1s leaves 1.6e-6,
+    which held the doors one whole step too long (5 steps per stop instead
+    of 4) and cost the JAX env about 7% of its deliveries on `full`. In
+    float64 the remainder is negative and clipped, so the snap changes
+    nothing there.
+    """
+    timer = max(timer - dt, 0.0)
+    return 0.0 if timer < DOOR_SNAP * dt else timer
 
 
 def _traffic_patterns(n_floors):

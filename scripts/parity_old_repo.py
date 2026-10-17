@@ -9,7 +9,9 @@ side by side:
   have), rewards and info must match exactly.
 - JAX env: the same key must give the same trajectory, including the
   arrivals drawn on the device, since the draw is the same code moved into
-  `core.demand`.
+  `core.demand`. Run in float64: in float32 the new env deliberately differs
+  on the kinematic presets, where the old one held the doors open one step
+  too long (see `sim._count_down`).
 
     uv run python scripts/parity_old_repo.py [--old-repo PATH]
 """
@@ -21,6 +23,8 @@ from pathlib import Path
 
 import jax
 import numpy as np
+
+jax.config.update("jax_enable_x64", True)
 
 PRESETS = ["original", "tall", "multi", "kinematic", "hall_calls", "full"]
 OPTIONS = [
