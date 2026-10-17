@@ -277,9 +277,10 @@ block first. Presets, one hard feature at a time:
 - [x] Metrics: total and weighted delay, passengers served, deadlocks,
       conflicts resolved. Done: delay per train, deadlock rate, trains
       finished, held and blocked counts. Passengers are not modelled yet.
-- [ ] Hindsight bound on small presets: solve the alternative-graph MILP
+- [x] Hindsight bound on small presets: solve the alternative-graph MILP
       after the episode with all disruptions known (e.g. HiGHS via `highspy`;
       check the dependency first). Report each policy's gap to it.
+      Done: `envs/train/bound.py`, `scripts/bound_eval.py`; result below.
 - [ ] Optional: load a few small DISPLIB instances as test networks.
 
 **Result.** Env built and verified; RL matches the rules where they are
@@ -338,6 +339,61 @@ optimal and copies section reservation, but does not yet improve on it.
   - On `passing`, no rule or learner beats FCFS yet. Holding a stopping
     train in a loop for a following express is the decision that could
     help, and it needs look-ahead along the route behind the train.
+- **Common random numbers.** Running-time noise and incidents were drawn
+  per tick, so a train's running time depended on when it entered a
+  block, and "the same scenario under another policy" was not defined.
+  They are now drawn per train and route position at reset (a `Trip` in
+  the state). The distribution is unchanged (each train enters each block
+  once), but a seed now fixes the scenario for every policy, which also
+  cuts the variance of policy comparisons. Numbers after this change
+  differ from the tables above by sampling noise only.
+- **Hindsight bound** (`envs/train/bound.py`). After an episode every
+  draw is known: the trip, and the closures (the disruption process does
+  not depend on the trains, so a rollout of all-WAIT recovers them). The
+  best schedule for that scenario is a MILP over integer entry ticks: route
+  order with the env's rounded block times, departures, one big-M
+  disjunction per pair of trains sharing a block (with the env's +1 tick
+  for a freed block), one per train and closure window, and total
+  lateness as the objective. Any env trajectory in which all trains
+  finish is feasible for it with the same cost, so its optimum is a lower
+  bound (tested on `single` and `blockage`, and zero on a calm timetable).
+  About 150 binaries on `single`; HiGHS solves it in 0.2–1.5 s on average.
+  *Dependency check:* `highspy` 1.15.1 is MIT (licence expression in the
+  wheel metadata), depends only on NumPy, ships cp312 manylinux wheels
+  (about 7 MB); added as the optional extra `bound` and to the dev group,
+  not as a core dependency.
+- **Gaps to the bound** (`scripts/bound_eval.py`, 200 scenarios per
+  preset, 720-tick horizon so trains finish; minutes per train, over the
+  episodes where the policy finished every train):
+
+  | Preset | Bound | FCFS | Section reservation | Route setting | Route setting above bound |
+  |---|---|---|---|---|---|
+  | `line` | 0.88 | 0.88 | 0.88 | 0.88 | 1% |
+  | `passing` | 1.56 | 2.16 | 2.16 | 2.16 | **28%** |
+  | `single` | 1.04 | 0.62\* | 0.99\* | 1.11 | 8% |
+  | `blockage` | 2.50 | 0.90\* | 1.89\* | 2.66 | 12% |
+
+  \* Over the episodes it finished (FCFS finishes 77% on `single`, 59% on
+  `blockage`; route setting 99.5% and 98%), so these are the easy ones;
+  compare each with the bound on the same episodes: FCFS is at the bound
+  (gap 0.00) whenever it does not deadlock, section reservation within
+  0.05 min. All solves were optimal except 2% on `blockage`, which hit the
+  30 s limit and report the dual bound (still valid).
+- **What the bound says.**
+  - `line` and `single` leave almost nothing to learn: the rules are
+    within 1–8% of a dispatcher who knows the future. On single track the
+    whole problem is avoiding deadlocks; once a rule does that, little
+    remains. This explains the RL results above better than the credit
+    problem alone: there was no headroom to find.
+  - **`passing` is where the headroom is**: 28% of the delay (0.6 min per
+    train, at least 0.14 in every scenario) is avoidable, and no rule
+    captures any of it. It comes from overtaking: holding a stopping train
+    in a loop so an express can pass. That is the next target for a
+    better rule, a look-ahead planner and RL.
+  - The bound knows the future, so part of any gap is the value of
+    information, not achievable by any non-anticipative policy. A
+    stochastic look-ahead (sample scenarios, solve, act) would measure
+    how much.
 ### Phase 4: disruptions
 
 - [x] Core disruption process: edge outages (`κ_e = 0`), slow running
@@ -526,6 +582,14 @@ designed for.
 - RL proposes, a solver repairs: RL picks train orderings and a replanner
   makes them feasible.
 - Semi-MDP / event-driven decisions, if fixed ticks prove too coarse.
+- Bound: a `--bound` option in the harness; a TERMINATE-aware MILP
+  (optional calls with a penalty) for `response`; slow running (speed
+  depends on the entry tick); a rolling-horizon MILP policy (DLA) using
+  only what is known at decision time, to split the gap into
+  value-of-information and policy suboptimality.
+- Harder train presets with headroom: denser single-track timetables
+  (more trains, shorter headways), and `passing` with a look-behind
+  observation (the train behind and its speed).
 - Train response actions: vehicle circulation (each eastbound trip's
   vehicle forms a westbound trip after a layover), so a short-turn also
   runs the return trip early from the turning station and gets credit

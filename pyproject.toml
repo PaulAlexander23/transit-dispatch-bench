@@ -16,11 +16,17 @@ dependencies = [
     "optax>=0.2.4",
 ]
 
+[project.optional-dependencies]
+bound = [
+    "highspy>=1.15.1",
+]
+
 [dependency-groups]
 # The CUDA 12 plugin: CUDA 13 builds dropped Pascal GPUs (GTX 10xx).
 #   uv sync --group jax-cuda
 jax-cuda = ["jax[cuda12]>=0.6 ; sys_platform == 'linux'"]
 dev = [
+    "highspy>=1.15.1",
     "pytest>=9",
     "ruff>=0.6",
     "scipy>=1.13",

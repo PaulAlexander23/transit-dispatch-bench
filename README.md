@@ -21,6 +21,7 @@ call).
 uv sync --group jax-cuda            # or plain `uv sync` for CPU JAX
 uv run pytest                       # tests, including step-for-step parity
 uv run python -m transit_bench.benchmark --write docs/results.md
+uv run --extra bound python scripts/bound_eval.py   # gaps to the hindsight-optimal schedule
 uv run python -m transit_bench.algos.ppo --env elevator/full-v0 --pretrain 100000 \
     --n-envs 1024 --n-steps 8 --batch-size 2048 --n-epochs 10 \
     --learning-rate 5.2e-5 --timesteps 10000000

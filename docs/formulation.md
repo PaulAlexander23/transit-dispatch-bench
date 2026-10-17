@@ -83,6 +83,10 @@ capacity 1. An operation is train `i` occupying block `b`, starting at
 - Objective: weighted lateness `Σ_i w_i · max(0, t_i,end − sched_i)`, or
   passenger delay when passengers are modelled.
 
+The env's hindsight bound (`envs/train/bound.py`) is this MILP with the
+episode's realised running times and closures, over integer ticks; its
+optimum is a lower bound on any policy's cost for that scenario.
+
 In the alternative graph each operation is a node, each fixed constraint an
 arc, and each disjunction a pair of alternative arcs. A schedule chooses one
 arc per pair; it is feasible if the chosen graph has no positive-length cycle,
