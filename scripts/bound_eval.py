@@ -21,6 +21,7 @@ from transit_bench.envs.train.bound import run, scenarios, solve
 from transit_bench.envs.train.heuristic import (
     FirstComeFirstServed,
     GiveWayToExpress,
+    Reroute,
     RouteSetting,
     SectionReservation,
 )
@@ -28,7 +29,9 @@ from transit_bench.envs.train.heuristic import (
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--presets", nargs="+", default=["line", "passing", "single", "blockage"])
+    parser.add_argument(
+        "--presets", nargs="+", default=["line", "passing", "single", "blockage", "junction"]
+    )
     parser.add_argument("--episodes", type=int, default=200)
     parser.add_argument("--max-steps", type=int, default=720)
     parser.add_argument("--time-limit", type=float, default=30.0)
@@ -53,6 +56,7 @@ def main():
             ("section reservation", SectionReservation(env)),
             ("route setting", RouteSetting(env)),
             ("give way to express", GiveWayToExpress(env)),
+            ("reroute", Reroute(env)),
         ]:
             episode = jax.jit(jax.vmap(lambda k, env=env, policy=policy: run(env, policy, k)))
             cost, finished = map(np.asarray, episode(keys))

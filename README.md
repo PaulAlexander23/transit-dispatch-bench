@@ -10,12 +10,13 @@ heuristic, and a normalised score (random = 0, heuristic = 1).
 |---|---|---|---|
 | `elevator/*` | Line of floors | Move or serve, per lift | Collective control |
 | `bus/*` | Loop of stops | Go or hold, per deciding bus | Headway-based holding |
-| `train/*` | Blocks of track, double or single | Go or wait (or terminate), per deciding train | Route setting, giving way to expresses |
+| `train/*` | Blocks of track, double or single | Go or wait (or terminate, or divert), per deciding train | Route setting, giving way to expresses, rerouting |
 
 Disruptions (blocked or slowed edges; Markov, semi-Markov or scripted) are a
 core process; `train/blockage-v0` switches them on, and `train/response-v0`
 adds a TERMINATE action (cancel or short-turn a train, at a cost per missed
-call).
+call). `train/junction-v0` adds route choice: relief tracks alongside two
+sections, and a DIVERT action to take them.
 
 ```sh
 uv sync --group jax-cuda            # or plain `uv sync` for CPU JAX

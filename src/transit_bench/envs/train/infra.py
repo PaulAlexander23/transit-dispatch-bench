@@ -16,6 +16,13 @@ through it and their timetable, as plain NumPy arrays:
   every station and use the loop platform where there is one, so express
   trains can overtake them there; express trains run faster and only stop
   at the ends.
+- A *relief track* (`relief_sections`) is a second track alongside a
+  section, `relief_slowdown` times slower, used in both directions. A
+  train standing at the station before such a section chooses which track
+  to take (GO for the main one, DIVERT for the relief): the network's
+  route choice. Both tracks have `blocks_per_section` blocks, so a train's
+  route positions, timetable and calls are the same whichever it takes;
+  `alt_route` and `alt_run` give the relief alternative per position.
 
 Times are in ticks of `step_seconds`. The timetable gives each train the
 time it should enter each block of its route, from its departure time and
@@ -63,6 +70,10 @@ class TrainConfig:
     # departs, or short-turn it at a platform); each scheduled call the
     # train then misses costs this many minutes.
     terminate_penalty: float = 0.0
+    # Sections (index s joins stations s and s + 1) with a relief track, and
+    # its running times relative to the main track's.
+    relief_sections: tuple = ()
+    relief_slowdown: float = 1.25
 
     def __post_init__(self):
         if self.n_stations < 2 or self.blocks_per_section < 1:
@@ -71,6 +82,10 @@ class TrainConfig:
             raise ValueError("terminate_penalty must be >= 0")
         if self.single_track and self.passing_loops:
             raise ValueError("single-track lines pass at their crossing loops only")
+        if any(not 0 <= s < self.n_stations - 1 for s in self.relief_sections):
+            raise ValueError("relief_sections must name sections 0 .. n_stations - 2")
+        if self.relief_slowdown < 1:
+            raise ValueError("relief_slowdown must be >= 1")
 
     @property
     def n_trains(self):
@@ -97,6 +112,10 @@ PRESETS["response"] = replace(
     disruption=DisruptionConfig(mode="markov", rate_per_hour=0.1, mean_seconds=1200.0),
     terminate_penalty=5.0,
 )
+# Route choice: the blockage line with a relief track alongside the two
+# middle sections, 25% slower. A train can divert onto it around a closed
+# block, or to cross an oncoming train between stations.
+PRESETS["junction"] = replace(PRESETS["blockage"], relief_sections=(1, 2))
 
 
 class Infra(NamedTuple):
@@ -130,6 +149,10 @@ class Infra(NamedTuple):
     cum_ticks: np.ndarray
     # (blocks,) bool: a loop platform, where a following train can overtake
     loop_platform: np.ndarray
+    # (trains, L): the relief-track block a train can take at each route
+    # position instead (-1 if none), and its nominal running seconds there.
+    alt_route: np.ndarray
+    alt_run: np.ndarray
 
 
 def build(config: TrainConfig) -> Infra:
@@ -157,6 +180,13 @@ def build(config: TrainConfig) -> Infra:
             for d in range(2)
         ]
 
+    # Relief tracks: one id per stretch, after the main sections' ids.
+    first_relief = 1 + max(w for kind, w in blocks if kind == "section")
+    relief = {
+        s: [add("section", first_relief + n) for _ in range(k)]
+        for n, s in enumerate(sorted(set(c.relief_sections)))
+    }
+
     n_blocks = len(blocks)
     station_of = np.array([w if kind == "station" else -1 for kind, w in blocks])
     section_of = np.array([w if kind == "section" else -1 for kind, w in blocks])
@@ -177,6 +207,8 @@ def build(config: TrainConfig) -> Infra:
     run = np.zeros((T, L))
     dwell = np.zeros((T, L), np.int64)
     sched = np.zeros((T, L + 1))
+    alt_route = np.full((T, L), -1, np.int64)
+    alt_run = np.zeros((T, L))
     for i, (d, express, depart) in enumerate(trains):
         order = range(n_st) if d == EAST else range(n_st - 1, -1, -1)
         steps = []
@@ -184,16 +216,19 @@ def build(config: TrainConfig) -> Infra:
         for pos, s in enumerate(stations):
             stop = (not express) or pos in (0, len(stations) - 1)
             platform = loop[d][s] if (has_loop[s] and not express) else main[d][s]
-            steps.append((platform, c.platform_seconds, stop))
+            steps.append((platform, c.platform_seconds, stop, -1))
             if pos < len(stations) - 1:
                 nxt = stations[pos + 1]
                 sec = section[d][min(s, nxt)]
                 js = range(k) if d == EAST else range(k - 1, -1, -1)
                 seconds = c.section_block_seconds / (c.express_speedup if express else 1.0)
-                steps += [(sec[j], seconds, False) for j in js]
+                alt = relief.get(min(s, nxt), [-1] * k)
+                steps += [(sec[j], seconds, False, alt[j]) for j in js]
         t = depart
-        for j, (block, seconds, stop) in enumerate(steps):
+        for j, (block, seconds, stop, alt) in enumerate(steps):
             route[i, j] = block
+            alt_route[i, j] = alt
+            alt_run[i, j] = seconds * c.relief_slowdown if alt >= 0 else 0.0
             run[i, j] = seconds
             dwell[i, j] = math.ceil(c.dwell_seconds / c.step_seconds) if stop else 0
             sched[i, j] = t
@@ -221,8 +256,9 @@ def build(config: TrainConfig) -> Infra:
     n_sections = int(section_of.max()) + 1
     used = np.zeros((n_sections, 2), bool)
     for i in range(T):
-        secs = section_of[route[i]]
-        used[secs[secs >= 0], direction[i]] = True
+        for r in (route[i], alt_route[i][alt_route[i] >= 0]):
+            secs = section_of[r]
+            used[secs[secs >= 0], direction[i]] = True
     section_shared = used.all(axis=1)
     calls = np.concatenate([dwell > 0, np.zeros((T, 1), bool)], axis=1)
     calls_from = np.cumsum(calls[:, ::-1], axis=1)[:, ::-1]
@@ -247,4 +283,6 @@ def build(config: TrainConfig) -> Infra:
         calls_from,
         cum_ticks,
         loop_platform,
+        alt_route,
+        alt_run,
     )

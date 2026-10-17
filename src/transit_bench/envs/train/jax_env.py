@@ -19,6 +19,7 @@ from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from transit_bench.core import disruption
 from transit_bench.core.network import EdgeState
@@ -27,6 +28,7 @@ from transit_bench.envs.train.infra import PRESETS, TrainConfig, build
 from transit_bench.envs.train.sim import (
     BLOCK_FIELDS,
     DELAY_SCALE,
+    DIVERT,
     GO,
     HEAD_FIELDS,
     LOOKAHEAD,
@@ -45,6 +47,7 @@ INFO_INT = (
     "blocked",
     "terminated",
     "missed",
+    "diverted",
     "deadlocked",
     "finished",
 )
@@ -52,6 +55,7 @@ INFO_INT = (
 
 class TrainState(NamedTuple):
     pos: jax.Array  # (trains,) int: index on the route, -1 before it, route_len after
+    relief: jax.Array  # (trains, L) bool: on the relief track at that route position
     remaining: jax.Array  # (trains,) int: ticks left in the current block
     arrival_delay: jax.Array  # (trains,) float: seconds late at the end, once arrived
     occupant: jax.Array  # (blocks,) int: the train holding each block, or -1
@@ -66,9 +70,11 @@ class TrainState(NamedTuple):
 class TrainEnv:
     """Train dispatching on blocks of track, as pure JAX functions.
 
-    `n_agents` trains each choose GO (0) or WAIT (1), and TERMINATE (2) if
-    the config has a `terminate_penalty`; only deciding trains' choices,
-    and terminating trains', take effect (`active_agents`). The observation is one block of
+    `n_agents` trains each choose GO (0) or WAIT (1), TERMINATE (2) if
+    the config has a `terminate_penalty`, and DIVERT (3) if it has relief
+    tracks (then there are 4 actions, and TERMINATE without a penalty
+    holds, as WAIT does); only deciding trains' choices, and terminating
+    trains', take effect (`active_agents`). The observation is one block of
     features per train (`per_agent_obs`), as `sim.TrainSim.observe`.
 
     With `shield=True` a safety shield vetoes any GO that route setting
@@ -90,7 +96,19 @@ class TrainEnv:
         self.infra = infra = build(c)
         self.n_trains = T = len(infra.route)
         self.n_agents = T
-        self.n_actions = 3 if c.terminate_penalty > 0 else 2
+        self.has_relief = bool((infra.alt_route >= 0).any())
+        self.n_actions = 4 if self.has_relief else 3 if c.terminate_penalty > 0 else 2
+        # span[i, q, p]: diverting into route position q puts train i on the
+        # relief track at p (the rest of that section).
+        T_, L = infra.route.shape
+        span = np.zeros((T_, L, L), bool)
+        for i in range(T_):
+            for q in range(L):
+                p = q
+                while p < L and infra.alt_route[i, p] >= 0:
+                    span[i, q, p] = True
+                    p += 1
+        self.span = span
         self.per_agent_obs = True
         self.observation_nvec = None
         self.observation_size = T * (HEAD_FIELDS + BLOCK_FIELDS * LOOKAHEAD)
@@ -100,10 +118,12 @@ class TrainEnv:
 
     def heuristic(self):
         """The strongest rules combined (`sim.heuristic`): route setting;
-        `GiveWayToExpress` where there are expresses; `TerminateWhenStuck`
-        where the config allows TERMINATE."""
+        `GiveWayToExpress` where there are expresses; `Reroute` where there
+        are relief tracks; `TerminateWhenStuck` where the config allows
+        TERMINATE."""
         from transit_bench.envs.train.heuristic import (
             GiveWayToExpress,
+            Reroute,
             RouteSetting,
             TerminateWhenStuck,
         )
@@ -111,6 +131,8 @@ class TrainEnv:
         rule = RouteSetting(self)
         if self.infra.express.any():
             rule = GiveWayToExpress(self, rule)
+        elif self.has_relief:
+            rule = Reroute(self, rule)
         if self.config.terminate_penalty > 0:
             rule = TerminateWhenStuck(self, rule)
         return rule
@@ -142,6 +164,7 @@ class TrainEnv:
         trip = Trip(jnp.asarray(trip.noise, f), jnp.asarray(trip.incident, f))
         return TrainState(
             pos=jnp.full(T, NOT_STARTED, jnp.int32),
+            relief=jnp.zeros(self.infra.route.shape, bool),
             remaining=jnp.zeros(T, jnp.int32),
             arrival_delay=jnp.zeros(T, f),
             occupant=jnp.full(B, -1, jnp.int32),
@@ -190,9 +213,16 @@ class TrainEnv:
     def finished(self, state):
         return state.pos >= jnp.asarray(self.infra.route_len)
 
+    def route_now(self, state):
+        """(trains, L) each train's route, on the track it takes."""
+        route = jnp.asarray(self.infra.route, jnp.int32)
+        return jnp.where(state.relief, jnp.asarray(self.infra.alt_route, jnp.int32), route)
+
     def next_block(self, state):
-        """(trains,) the block each train would enter next, or -1 from its last."""
-        route, route_len, *_ = self._arrays()
+        """(trains,) the block each train would enter next (on the main track
+        at a junction), or -1 from its last."""
+        route_len = jnp.asarray(self.infra.route_len, jnp.int32)
+        route = self.route_now(state)
         nxt = state.pos + 1
         trains = jnp.arange(self.n_trains)
         block = route[trains, jnp.clip(nxt, 0, route.shape[1] - 1)]
@@ -205,11 +235,27 @@ class TrainEnv:
         due = jnp.where(started, state.remaining == 0, now >= sched[:, 0])
         return ~self.finished(state) & due
 
+    def alt_block(self, state):
+        """(trains,) at a junction, the relief block each train could enter
+        instead; else -1."""
+        alt = jnp.asarray(self.infra.alt_route, jnp.int32)
+        L = alt.shape[1]
+        trains = jnp.arange(self.n_trains)
+        nxt = state.pos + 1
+        a = alt[trains, jnp.clip(nxt, 0, L - 1)]
+        here = alt[trains, jnp.clip(state.pos, 0, L - 1)]
+        at = (nxt < jnp.asarray(self.infra.route_len)) & ((state.pos == NOT_STARTED) | (here < 0))
+        return jnp.where(at & ~self.finished(state) & (a >= 0), a, -1)
+
+    def free(self, state, b):
+        """Elementwise: block b exists, is unoccupied and open."""
+        safe = jnp.maximum(b, 0)
+        return (b >= 0) & (state.occupant[safe] < 0) & state.blocks.open[safe]
+
     def deciding(self, state):
         b = self.next_block(state)
-        safe = jnp.maximum(b, 0)
-        free = (state.occupant[safe] < 0) & state.blocks.open[safe]
-        return self.ready(state) & (b >= 0) & free
+        either = self.free(state, b) | self.free(state, self.alt_block(state))
+        return self.ready(state) & (b >= 0) & either
 
     def can_terminate(self, state):
         """(trains,) bool: ready, not started or on a platform, not at the
@@ -223,7 +269,7 @@ class TrainEnv:
 
     def here(self, state):
         """(trains,) the block each train holds, or -1."""
-        route = jnp.asarray(self.infra.route, jnp.int32)
+        route = self.route_now(state)
         block = route[jnp.arange(self.n_trains), jnp.clip(state.pos, 0, route.shape[1] - 1)]
         return jnp.where((state.pos != NOT_STARTED) & ~self.finished(state), block, -1)
 
@@ -265,6 +311,7 @@ class TrainEnv:
         b = self.next_block(state)
         started = state.pos != NOT_STARTED
         waiting = started & self.ready(state) & (b >= 0)
+        waiting = waiting & ~self.free(state, self.alt_block(state))  # see sim.waits_for
         holder = jnp.where(waiting, state.occupant[jnp.maximum(b, 0)], -1)
         reach = (holder[:, None] == jnp.arange(T)[None, :]) & (holder[:, None] >= 0)
         for _ in range(self.n_squarings):
@@ -293,31 +340,44 @@ class TrainEnv:
             state
         )
         nxt_block = self.next_block(state)
+        alt_block = self.alt_block(state)
+        free_main = self.free(state, nxt_block)
+        free_alt = self.free(state, alt_block)
+        alt_route = jnp.asarray(self.infra.alt_route, jnp.int32)
+        alt_run = jnp.asarray(self.infra.alt_run, f)
+        span = jnp.asarray(self.span)
         B = self.n_blocks
         claimed = jnp.zeros(B, bool)
-        keys = ("entered", "arrived", "held", "blocked", "terminated", "missed")
+        keys = ("entered", "arrived", "held", "blocked", "terminated", "missed", "diverted")
         counts = {k: jnp.zeros((), jnp.int32) for k in keys}
         missed = self.missed_calls(state)
         pos, remaining = state.pos, state.remaining
-        occupant, arrival_delay = state.occupant, state.arrival_delay
+        occupant, arrival_delay, relief = state.occupant, state.arrival_delay, state.relief
+        L = route.shape[1]
         for i in range(self.n_trains):  # in index order: earlier trains first
-            b = nxt_block[i]
+            divert = (actions[i] == DIVERT) & (alt_block[i] >= 0)
+            b = jnp.where(divert, alt_block[i], nxt_block[i])
             safe = jnp.maximum(b, 0)
             p = pos[i]
-            here = route[i, jnp.clip(p, 0, route.shape[1] - 1)]
+            cp = jnp.clip(p, 0, L - 1)
+            here = jnp.where(relief[i, cp], alt_route[i, cp], route[i, cp])
             stop = terminate[i]
-            leave = ready[i] & (b < 0)
-            can = ready[i] & (b >= 0) & deciding[i] & ~claimed[safe] & ~stop
-            enter = can & (actions[i] == GO)
-            held = can & (actions[i] != GO)
-            blocked = ready[i] & (b >= 0) & ~can & ~stop
+            leave = ready[i] & (nxt_block[i] < 0)
+            chosen_free = jnp.where(divert, free_alt[i], free_main[i])
+            can = ready[i] & (b >= 0) & deciding[i] & chosen_free & ~claimed[safe] & ~stop
+            moving = (actions[i] == GO) | divert
+            enter = can & moving
+            held = can & ~moving
+            blocked = ready[i] & (nxt_block[i] >= 0) & ~can & ~stop
             vacate = leave | ((stop | enter) & (p != NOT_STARTED))
             occupant = occupant.at[jnp.where(vacate, here, B)].set(-1, mode="drop")
             occupant = occupant.at[jnp.where(enter, b, B)].set(i, mode="drop")
             claimed = claimed.at[jnp.where(enter, b, B)].set(True, mode="drop")
-            new_p = jnp.clip(p + 1, 0, route.shape[1] - 1)
+            new_p = jnp.clip(p + 1, 0, L - 1)
+            relief = relief.at[i].set(relief[i] | (enter & divert & span[i, new_p]))
             noise, incident = state.trip.noise[i, new_p], state.trip.incident[i, new_p]
-            seconds = run[i, new_p] * state.blocks.speed[safe] * noise + incident
+            base = jnp.where(relief[i, new_p], alt_run[i, new_p], run[i, new_p])
+            seconds = base * state.blocks.speed[safe] * noise + incident
             ticks = jnp.maximum(1, jnp.ceil(seconds / c.step_seconds - 1e-9).astype(jnp.int32))
             remaining = remaining.at[i].set(jnp.where(enter, ticks + dwell[i, new_p], remaining[i]))
             late = jnp.maximum(0.0, now - sched[i, route_len[i]])
@@ -327,11 +387,13 @@ class TrainEnv:
             counts["terminated"] += stop
             counts["missed"] += jnp.where(stop, missed[i], 0)
             counts["entered"] += enter
+            counts["diverted"] += enter & divert
             counts["arrived"] += leave
             counts["held"] += held
             counts["blocked"] += blocked
         state = state._replace(
             pos=pos,
+            relief=relief,
             remaining=jnp.maximum(remaining - 1, 0),
             arrival_delay=arrival_delay,
             occupant=occupant,
@@ -368,11 +430,10 @@ class TrainEnv:
 
     def joining(self, state):
         """(trains,) the section each train is deciding to enter from outside, or -1."""
-        route = jnp.asarray(self.infra.route, jnp.int32)
         section_of = jnp.asarray(self.infra.section_of, jnp.int32)
         target = section_of[jnp.maximum(self.next_block(state), 0)]
-        here_block = route[jnp.arange(self.n_trains), jnp.clip(state.pos, 0, route.shape[1] - 1)]
-        here = jnp.where(state.pos != NOT_STARTED, section_of[here_block], -1)
+        here_block = self.here(state)
+        here = jnp.where(here_block >= 0, section_of[jnp.maximum(here_block, 0)], -1)
         joins = self.deciding(state) & (target >= 0) & (here != target)
         return jnp.where(joins, target, -1)
 
@@ -409,7 +470,8 @@ class TrainEnv:
 
     def observe(self, state):
         c = self.config
-        route, route_len, _, _, _, direction = self._arrays()
+        _, route_len, _, _, _, direction = self._arrays()
+        route = self.route_now(state)
         f = self._float()
         now = (state.t * c.step_seconds).astype(f)
         started = state.pos != NOT_STARTED
@@ -428,6 +490,8 @@ class TrainEnv:
                 direction.astype(bool),
                 self.can_terminate(state),
                 jnp.where(finished, 0, self.missed_calls(state)).astype(f) / c.n_stations,
+                self.alt_block(state) >= 0,
+                self.free(state, self.alt_block(state)),
                 *section_fields,
             ],
             axis=1,
@@ -451,4 +515,4 @@ class TrainEnv:
         return jnp.concatenate([head, ahead.reshape(self.n_trains, -1)], axis=1).ravel()
 
 
-__all__ = ["GO", "TERMINATE", "WAIT", "TrainEnv", "TrainState"]
+__all__ = ["DIVERT", "GO", "TERMINATE", "WAIT", "TrainEnv", "TrainState"]

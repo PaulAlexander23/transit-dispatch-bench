@@ -51,7 +51,7 @@ def baselines(env_id, env):
 
         out["first come first served"] = FirstComeFirstServed(env)
         out["section reservation"] = SectionReservation(env)
-        if env.n_actions == 3 or env.infra.express.any():  # the heuristic adds to it
+        if env.n_actions > 2 or env.infra.express.any():  # the heuristic adds to it
             out["route setting"] = RouteSetting(env)
     out["heuristic"] = env.heuristic()
     return out
@@ -77,12 +77,15 @@ def domain_metrics(env_id, env, rewards, info):
         delay = -np.asarray(rewards).sum(axis=0) / env.n_trains
         worst = np.sort(delay)[-max(1, len(delay) // 10) :]
         deadlocks = (info["deadlocked"].max(axis=0) > 0).mean()
+        penalty = env.config.terminate_penalty > 0
         out = [
-            ("cost/train" if env.n_actions == 3 else "delay/train", f"{delay.mean():.2f} min"),
+            ("cost/train" if penalty else "delay/train", f"{delay.mean():.2f} min"),
             ("CVaR10", f"{worst.mean():.2f} min"),
             ("deadlocks", f"{deadlocks:.3f}"),
         ]
-        if env.n_actions == 3:
+        if env.has_relief:
+            out.append(("diverted/ep", f"{info['diverted'].sum(axis=0).mean():.2f}"))
+        if penalty:
             out.append(("terminated/ep", f"{info['terminated'].sum(axis=0).mean():.2f}"))
         return out
     return []

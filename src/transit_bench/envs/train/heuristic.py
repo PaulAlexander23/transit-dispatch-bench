@@ -1,12 +1,26 @@
 """Train dispatching heuristics in JAX, reading the env state.
 
 The Python references are `sim.first_come_first_served`,
-`sim.section_reservation`, `sim.route_setting` and `sim.terminate_when_stuck`.
+`sim.section_reservation`, `sim.route_setting`, `sim.reroute`,
+`sim.terminate_when_stuck` and `sim.give_way_to_express`.
 """
 
 import jax.numpy as jnp
 
-from transit_bench.envs.train.sim import GO, NOT_STARTED, TERMINATE, WAIT
+from transit_bench.envs.train.sim import DIVERT, GO, NOT_STARTED, TERMINATE, WAIT
+
+
+def section_occupancy(env, state):
+    """(sections + 1, 2) bool: [s, d] a train going direction d is in section
+    s (the last row is a sink for blocks outside sections)."""
+    S = env.n_sections
+    section_of = jnp.asarray(env.infra.section_of, jnp.int32)
+    direction = jnp.asarray(env.infra.direction, jnp.int32)
+    holder = state.occupant
+    in_section = (holder >= 0) & (section_of >= 0)
+    rows = jnp.where(in_section, section_of, S)
+    cols = direction[jnp.maximum(holder, 0)]
+    return jnp.zeros((S + 1, 2), bool).at[rows, cols].max(in_section)
 
 
 class FirstComeFirstServed:
@@ -44,19 +58,12 @@ class SectionReservation:
         S = env.n_sections
         section_of = jnp.asarray(infra.section_of, jnp.int32)
         direction = jnp.asarray(infra.direction, jnp.int32)
-        route = jnp.asarray(infra.route, jnp.int32)
-        # occupied[s, d]: a train going direction d is in section s.
-        holder = state.occupant
-        held_dir = direction[jnp.maximum(holder, 0)]
-        in_section = (holder >= 0) & (section_of >= 0)
-        occupied = jnp.zeros((S + 1, 2), bool)
-        rows = jnp.where(in_section, section_of, S)
-        occupied = occupied.at[rows, held_dir].max(in_section)[:S]
+        occupied = section_occupancy(env, state)[:S]
         deciding = env.deciding(state)
         nxt = env.next_block(state)
         target = section_of[jnp.maximum(nxt, 0)]
-        here_block = route[jnp.arange(env.n_trains), jnp.clip(state.pos, 0, route.shape[1] - 1)]
-        here = jnp.where(state.pos != NOT_STARTED, section_of[here_block], -1)
+        here_block = env.here(state)
+        here = jnp.where(here_block >= 0, section_of[jnp.maximum(here_block, 0)], -1)
         entering = jnp.zeros((S, 2), bool)
         actions = []
         for i in range(env.n_trains):
@@ -89,6 +96,60 @@ class RouteSetting(SectionReservation):
         shared = jnp.asarray(env.infra.section_shared)[jnp.maximum(joining, 0)]
         wait = (joining >= 0) & shared & taken
         return carry, jnp.where(wait, WAIT, actions).astype(jnp.int32)
+
+
+class Reroute:
+    """`rule` (route setting by default), plus: at a junction, take the
+    relief track when the main one is no good now.
+
+    `sim.reroute` in JAX: a deciding train at a junction keeps the rule's GO
+    if the main track's next block is free and none of the section's main
+    blocks is closed; otherwise it diverts if the relief track's first
+    block is free, none of its blocks is closed, no train going the other
+    way is in it or diverting into it this tick ahead of this one, and the
+    platform at its far end is free. A loop over trains, for the "this
+    tick ahead of it" part.
+    """
+
+    def __init__(self, env, rule=None):
+        self.env = env
+        self.rule = rule if rule is not None else RouteSetting(env)
+
+    def init(self):
+        return self.rule.init()
+
+    def act(self, carry, state, key=None):
+        carry, actions = self.rule.act(carry, state, key)
+        env, infra = self.env, self.env.infra
+        T, L = infra.route.shape
+        section_of = jnp.asarray(infra.section_of, jnp.int32)
+        direction = jnp.asarray(infra.direction, jnp.int32)
+        route = jnp.asarray(infra.route, jnp.int32)
+        alt_route = jnp.asarray(infra.alt_route, jnp.int32)
+        far_table = jnp.asarray(infra.far_platform, jnp.int32)
+        rows = jnp.arange(T)
+        q = jnp.clip(state.pos + 1, 0, L - 1)
+        span = jnp.asarray(env.span)[rows, q]  # (T, L)
+        is_open = state.blocks.open
+        main_closed = (span & ~is_open[jnp.maximum(route, 0)]).any(axis=1)
+        relief_closed = (span & ~is_open[jnp.maximum(alt_route, 0)]).any(axis=1)
+        alt = env.alt_block(state)
+        at = (alt >= 0) & env.deciding(state)
+        keep = (actions == GO) & env.free(state, env.next_block(state)) & ~main_closed
+        far = far_table[rows, q]
+        taken = (far >= 0) & (state.occupant[jnp.maximum(far, 0)] >= 0)
+        open_relief = env.free(state, alt) & ~relief_closed & ~taken
+        occupied = section_occupancy(env, state)
+        section = jnp.where(alt >= 0, section_of[jnp.maximum(alt, 0)], env.n_sections)
+        entering = jnp.zeros_like(occupied)
+        out = []
+        for i in range(T):
+            d, s = direction[i], section[i]
+            against = occupied[s, 1 - d] | entering[s, 1 - d]
+            divert = at[i] & ~keep[i] & open_relief[i] & ~against
+            entering = entering.at[s, d].set(entering[s, d] | divert)
+            out.append(jnp.where(divert, DIVERT, actions[i]))
+        return carry, jnp.stack(out).astype(jnp.int32)
 
 
 class TerminateWhenStuck:

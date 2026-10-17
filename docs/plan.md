@@ -266,7 +266,9 @@ block first. Presets, one hard feature at a time:
 - [x] `passing`: passing loops, mixed fast and slow trains (overtaking).
 - [x] `single`: single track with crossing points; deadlock becomes possible.
       Detect it in JAX by repeated squaring of the wait-for matrix.
-- [ ] `junction`: a small network with route choice.
+- [x] `junction`: a small network with route choice. Done as relief
+      tracks: a second, slower track alongside a section, and a DIVERT
+      action at the station before it (Result below).
 - [x] Heuristics: keep to timetable with first-come-first-served at
       conflicts; prioritised replanning (the Flatland 2020 winners' approach),
       so RL is compared with a planner, not only a rule.
@@ -421,6 +423,69 @@ optimal and copies section reservation, but does not yet improve on it.
   see a late express or a long dwell coming, and some of it is the value
   of information. This is the headroom a learner or a stochastic
   look-ahead could go after on `passing`.
+- **Route choice: relief tracks and DIVERT** (`TrainConfig.relief_sections`,
+  `train/junction-v0`). A full graph with arbitrary alternative routes
+  would change every per-train table (routes, timetable, calls, the
+  bound's variables) into a per-route one. A *relief track* keeps them
+  all: a second track alongside a section, with the same number of
+  blocks, `relief_slowdown` (1.25) times slower, used in both directions.
+  A train's route positions line up whichever track it takes, so the
+  timetable, its calls, the trip's noise (per position) and the platforms
+  are unchanged; only the block and its running time at those positions
+  differ (`Infra.alt_route`, `alt_run`). The state gains a (trains, L)
+  flag, on the relief track at each position.
+  - **DIVERT** (action 3; the action space is 4 wherever there is a relief
+    track) is legal *at a junction*, i.e. on the platform before such a
+    section: the train enters the relief track's first block and follows
+    it to the end of the section. A train at a junction is deciding if
+    either first block is free and open, and blocked if the one it chose
+    is not. Observation: two more head fields (at a junction; the relief
+    block is free and open), so `HEAD_FIELDS` is now 17 on every preset.
+  - **Deadlock detection becomes approximate there.** With two ways out,
+    the wait-for relation is an AND-OR graph: a train at a junction is
+    stuck only if both next blocks' holders are. Squaring the wait-for
+    matrix handles single successors only, so a train whose relief block
+    is free counts as waiting for no one, and one whose relief block is
+    taken counts as waiting for the main block's holder only. So a policy
+    that ignores the relief track can sit in a "deadlock" the metric does
+    not report (section reservation on `junction`: 0 deadlocks, but delay
+    as on `blockage`).
+  - **`junction` preset**: `blockage` plus relief tracks alongside the two
+    middle sections. The relief blocks are numbered after all the others
+    and closures are drawn per block in one vector, so the main blocks'
+    closures are the same as `blockage`'s for a seed: route setting, which
+    never diverts, scores the same on both (2.96 vs 3.01 min per train).
+  - **Rule: `Reroute`** (the `junction` heuristic): route setting, plus at
+    a junction, if the main track's next block is taken or any of the
+    section's main blocks is closed, divert when the relief track is free,
+    open throughout, has no oncoming train in it (or diverting into it
+    ahead in the acting order), and the platform at its far end is free
+    (route setting for the relief track, which carries both directions).
+  - **Hindsight bound with route choice.** One more binary per train and
+    relief section; times in those blocks are `d + (d_relief − d) z`, and
+    each blocking and closure constraint on a block is relaxed by M for a
+    train that does not use it. Still below every finished episode
+    (tested on `junction`), 99% solved to optimality, 0.8 s on average.
+  - **Results** (harness, 512 episodes; `scripts/bound_eval.py`, 200
+    scenarios; minutes per train):
+
+    | Policy on `junction` | Delay | CVaR10 | Above bound |
+    |---|---|---|---|
+    | Route setting (never diverts) | 3.01 | 15.4 | 34% |
+    | **Reroute** | **1.75** | **7.05** | **10%** |
+    | Hindsight bound | | | (1.87 vs reroute's 2.09 on its scenarios) |
+
+    Diverting 1.5 times an episode cuts the mean by 42% and halves the
+    tail. Most of that is going around closures: on the calm
+    single-track line with the same relief tracks (1,024 episodes) reroute
+    gains only 1.16 → 0.98 min per train (0.9 diversions an episode, to
+    cross or pass a train), against 2.93 → 1.75 with closures.
+  - **What was learned.** Reroute is a greedy rule, yet it is within 10%
+    of the hindsight optimum, closer than any rule on the other
+    disruption presets. The remaining gap is the trade it never makes:
+    waiting for a main block that will clear soon instead of taking the
+    25% slower track, and diverting a train early to leave the main track
+    to a later one.
 ### Phase 4: disruptions
 
 - [x] Core disruption process: edge outages (`κ_e = 0`), slow running
@@ -432,9 +497,9 @@ optimal and copies section reservation, but does not yet improve on it.
 - [x] Train `blockage` preset with short-turn, cancel and reroute actions.
       Done: `blockage` (random closures on the single-track line) and
       `response` (longer closures plus TERMINATE, which cancels a trip
-      before departure or short-turns it at a platform). Reroute needs
-      route choice, so it comes with the `junction` preset (Phase 3); the
-      return half of a short-turn needs vehicle circulation (backlog).
+      before departure or short-turns it at a platform), and `junction`
+      (reroute onto a relief track with DIVERT, Phase 3). The return half
+      of a short-turn needs vehicle circulation (backlog).
 - [ ] Switch disruptions on for elevator (car out of service) and bus
       (road closure, breakdown). The bus env already holds buses at a
       closed edge; it is not yet wired to the process.
@@ -624,8 +689,17 @@ designed for.
   rule that prices the queue behind a blocked train (trains waiting for
   it × expected time left); a value baseline for TERMINATE from rollouts
   (DLA, Powell's fourth class).
-- Publish to GitHub (`PaulAlexander23/transit-dispatch-bench`, public);
-  confirm with the user first.
+- Route choice: general alternative routes on a graph (relief tracks
+  only cover a parallel track of equal length; a diversion via other
+  stations, skipping calls, needs per-route tables); an exact AND-OR
+  deadlock check for trains with two ways out; the shield and route
+  setting aware of the relief track (the shield vetoes on the main
+  track only); a reroute rule that weighs waiting for the main track
+  (expected time left) against the slower relief run.
+- CI: the workflow (`.github/workflows/ci.yml`) is not on GitHub yet: the
+  gh token lacks the `workflow` scope (`gh auth refresh -s workflow`),
+  so PR #1 went up without it. It is on the local `plan-rail-disruptions`
+  branch.
 
 ## Open questions
 

@@ -24,7 +24,7 @@ def test_a_calm_timetable_has_a_zero_bound():
     assert solve(env, scenario(env, jax.random.key(0))).cost == pytest.approx(0.0, abs=1e-6)
 
 
-@pytest.mark.parametrize("preset", ["single", "blockage"])
+@pytest.mark.parametrize("preset", ["single", "blockage", "junction"])
 def test_the_bound_is_below_every_finished_episode(preset):
     env = TrainEnv(preset, max_steps=720)  # long enough for everyone to finish
     episode = jax.jit(lambda k, policy: run(env, policy, k), static_argnums=1)

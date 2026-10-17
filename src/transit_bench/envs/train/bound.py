@@ -21,6 +21,11 @@ written as a MILP over integer entry ticks and solved with HiGHS:
   during a tick can be entered from the next tick.
 - Closures: a train may not enter a block in a tick it is closed: for each
   closed window `[s, e)` of ticks, `x ≤ s − 1` or `x ≥ e` (a binary each).
+- Route choice (relief tracks): a binary `z[i, s]` per train and relief
+  section, 1 if it takes the relief track. Times in those blocks are
+  `d + (d_relief − d) z`, and each blocking or closure constraint on a
+  block is relaxed by M for each train that does not use it (`1 − z` for
+  a main block of such a section, `z` for a relief block).
 - Objective: total lateness `Σ_i max(0, a[i] − scheduled arrival)`.
 
 Every env trajectory in which all trains finish is a feasible solution with
@@ -86,9 +91,11 @@ def scenario(env, key, n_steps=None):
     return scenarios(env, key[None], n_steps)[0]
 
 
-def durations(config, infra, noise, incident):
-    """(trains, L) ticks in each block, as the env computes them on entry."""
-    seconds = infra.run * noise + incident
+def durations(config, infra, noise, incident, run=None):
+    """(trains, L) ticks in each block, as the env computes them on entry
+    (on the relief track if `run` is `infra.alt_run`)."""
+    run = infra.run if run is None else run
+    seconds = run * noise + incident
     ticks = np.maximum(1, np.ceil(seconds / config.step_seconds - 1e-9)).astype(int)
     return ticks + infra.dwell
 
@@ -113,6 +120,7 @@ def solve(env, scen, time_limit=30.0, horizon=None):
     T, L = infra.route.shape
     dt = c.step_seconds
     d = durations(c, infra, scen.noise, scen.incident)
+    d_relief = durations(c, infra, scen.noise, scen.incident, infra.alt_run)
     horizon = horizon or 4 * max(env.max_steps, len(scen.closed))
     M = 2 * horizon
 
@@ -124,37 +132,58 @@ def solve(env, scen, time_limit=30.0, horizon=None):
     x = [[h.addIntegral(lb=start[i], ub=horizon) for _ in range(L)] for i in range(T)]
     a = [h.addIntegral(lb=start[i], ub=horizon) for i in range(T)]
     late = [h.addVariable(lb=0.0) for _ in range(T)]
+    # where[i][b] = (p, unused): train i is at route position p in block b,
+    # and `unused` is 0 if it always uses b, else the expression that is 1
+    # when it does not (it took the other track).
+    where = [{int(b): (p, 0) for p, b in enumerate(infra.route[i])} for i in range(T)]
+    ticks = [[int(d[i, p]) for p in range(L)] for i in range(T)]
+    section_of = infra.section_of
+    for i in range(T):
+        z = {}  # relief section -> binary
+        for p in np.flatnonzero(infra.alt_route[i] >= 0):
+            alt = int(infra.alt_route[i, p])
+            s = int(section_of[alt])
+            if s not in z:
+                z[s] = h.addBinary()
+            where[i][int(infra.route[i, p])] = (p, z[s])
+            where[i][alt] = (p, 1 - z[s])
+            ticks[i][p] = int(d[i, p]) + (int(d_relief[i, p]) - int(d[i, p])) * z[s]
     for i in range(T):
         for p in range(L - 1):
-            h.addConstr(x[i][p + 1] - x[i][p] >= int(d[i, p]))
-        h.addConstr(a[i] - x[i][L - 1] >= int(d[i, L - 1]))
+            h.addConstr(x[i][p + 1] - x[i][p] >= ticks[i][p])
+        h.addConstr(a[i] - x[i][L - 1] >= ticks[i][L - 1])
         h.addConstr(late[i] - dt * a[i] >= -float(infra.sched[i, L]))
 
     def leave(i, p):
         return x[i][p + 1] if p + 1 < L else a[i]
 
+    def relax(unused):
+        """M when the train does not use the block, else 0 (as an expression)."""
+        return 0 if isinstance(unused, int) else M * unused
+
     # Blocking: one binary per pair of trains sharing a block.
-    where = [{int(b): p for p, b in enumerate(infra.route[i])} for i in range(T)]
     for i in range(T):
         for j in range(i + 1, T):
-            for b, p in where[i].items():
-                q = where[j].get(b)
-                if q is None:
+            for b, (p, off_i) in where[i].items():
+                if b not in where[j]:
                     continue
+                q, off_j = where[j][b]
+                off = relax(off_i) + relax(off_j)
                 first = h.addBinary()  # 1: i uses b first
-                h.addConstr(x[j][q] - leave(i, p) >= 1 - M * (1 - first))
-                h.addConstr(x[i][p] - leave(j, q) >= 1 - M * first)
+                h.addConstr(x[j][q] - leave(i, p) + off >= 1 - M * (1 - first))
+                h.addConstr(x[i][p] - leave(j, q) + off >= 1 - M * first)
 
     # Closures: no entry while closed.
     for b, spans in enumerate(windows(scen.closed)):
         for i in range(T):
-            p = where[i].get(b)
-            if p is None:
+            if b not in where[i]:
                 continue
+            p, off = where[i][b]
+            off = relax(off)
             for s, e in spans:
                 before = h.addBinary()
-                h.addConstr(x[i][p] <= int(s) - 1 + M * (1 - before))
-                h.addConstr(x[i][p] >= int(e) - M * before)
+                h.addConstr(x[i][p] - off <= int(s) - 1 + M * (1 - before))
+                h.addConstr(x[i][p] + off >= int(e) - M * before)
 
     h.minimize(sum(late))
     info = h.getInfo()

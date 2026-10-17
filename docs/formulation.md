@@ -118,6 +118,15 @@ exceeds `c × missed calls`. Under Markov outages the expected time left is
 the mean whatever the elapsed time (memorylessness), so a rule needs only
 the mean; under semi-Markov ones the elapsed time is informative.
 
+Rerouting makes the route itself a decision: train `i` picks one of several
+block sequences, a binary `z_ir` per alternative `r` with `Σ_r z_ir = 1`, and
+each blocking disjunction on block `b` applies only if both trains' chosen
+routes use `b` (relaxed by `M(1 − z_ir)` otherwise). The env's relief tracks
+are the simplest case: two alternatives per section that differ only in
+which parallel track they take, so positions along the route line up and
+one binary per train and relief section suffices (`bound.py`). DIVERT is
+that choice made online, at the station before the section.
+
 ### Fleet
 
 Dynamic dial-a-ride on a grid or road graph. Each tick, assigning idle

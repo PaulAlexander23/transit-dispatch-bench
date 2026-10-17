@@ -38,6 +38,13 @@ Dynamics, in ticks of `step_seconds`:
   working needs vehicle circulation, which the env does not model). Such
   a train *can terminate* and is active even if its next block is taken
   or closed, which is when terminating is worth considering.
+- With relief tracks (`relief_sections`) there is a fourth action, DIVERT:
+  a train *at a junction* (its next block starts a section with a relief
+  track) enters the relief track's first block instead of the main
+  track's, and then follows the relief track to the end of the section.
+  Such a train is deciding if either block is free and open; it is blocked
+  if the one it chose is not. The noise and incidents of the trip are per
+  route position, so they are the same on either track.
 
 Reward: minus the change in total *projected* lateness, in minutes. A
 train's projected lateness is how late it will be at its next scheduled
@@ -60,9 +67,9 @@ import numpy as np
 from transit_bench.core import disruption
 from transit_bench.envs.train.infra import PRESETS, TrainConfig, build
 
-GO, WAIT, TERMINATE = 0, 1, 2
+GO, WAIT, TERMINATE, DIVERT = 0, 1, 2, 3
 NOT_STARTED = -1
-HEAD_FIELDS = 15
+HEAD_FIELDS = 17
 LOOKAHEAD = 4  # blocks ahead on the route in each train's observation
 BLOCK_FIELDS = 6
 DELAY_SCALE = 600.0  # seconds: observation scale for delays and times
@@ -106,6 +113,8 @@ class TrainSim:
         self.trip = trip if trip is not None else self.draw_trip()
         self.t = 0
         self.pos = [NOT_STARTED] * T
+        # Per train and route position: on the relief track there.
+        self.relief = [[False] * self.infra.route.shape[1] for _ in range(T)]
         self.remaining = [0] * T
         self.arrival_delay = [0.0] * T
         self.occupant = [-1] * self.infra.n_blocks
@@ -136,10 +145,26 @@ class TrainSim:
     def finished(self, i):
         return self.pos[i] >= self.infra.route_len[i]
 
+    def block_at(self, i, p):
+        """The block at route position p of train i, on the track it takes."""
+        table = self.infra.alt_route if self.relief[i][p] else self.infra.route
+        return int(table[i][p])
+
     def next_block(self, i):
-        """The block train i would enter next, or -1 from its last block."""
+        """The block train i would enter next (on the main track at a
+        junction), or -1 from its last block."""
         nxt = self.pos[i] + 1
-        return int(self.infra.route[i][nxt]) if nxt < self.infra.route_len[i] else -1
+        return self.block_at(i, nxt) if nxt < self.infra.route_len[i] else -1
+
+    def alt_block(self, i):
+        """At a junction, the relief block train i could enter instead; else -1."""
+        alt, nxt = self.infra.alt_route[i], self.pos[i] + 1
+        if self.finished(i) or nxt >= self.infra.route_len[i] or alt[nxt] < 0:
+            return -1
+        return int(alt[nxt]) if self.pos[i] == NOT_STARTED or alt[self.pos[i]] < 0 else -1
+
+    def free(self, b):
+        return b >= 0 and self.occupant[b] < 0 and self.block_open[b]
 
     def ready(self, i):
         if self.finished(i):
@@ -150,7 +175,7 @@ class TrainSim:
 
     def deciding(self, i):
         b = self.next_block(i)
-        return self.ready(i) and b >= 0 and self.occupant[b] < 0 and self.block_open[b]
+        return self.ready(i) and b >= 0 and (self.free(b) or self.free(self.alt_block(i)))
 
     def can_terminate(self, i):
         """Ready, not started or on a platform, and not at its last block."""
@@ -162,7 +187,7 @@ class TrainSim:
         """The block train i holds, or -1."""
         if self.pos[i] == NOT_STARTED or self.finished(i):
             return -1
-        return int(self.infra.route[i][self.pos[i]])
+        return self.block_at(i, self.pos[i])
 
     def missed_calls(self, i):
         """Calls train i would miss if it terminated now."""
@@ -178,12 +203,15 @@ class TrainSim:
         return max(0.0, exit_time - sched[self.pos[i] + 1])
 
     def waits_for(self):
-        """Per train, the train holding the block it is ready to enter, or -1."""
+        """Per train, the train holding the block it is ready to enter, or -1.
+        A train at a junction with the relief block free waits for no one;
+        with it taken, it counts as waiting for the main block's holder only
+        (an approximation: it is stuck only if both holders are)."""
         out = []
         for i in range(len(self.pos)):
             b = self.next_block(i)
             started = self.pos[i] != NOT_STARTED
-            waiting = started and self.ready(i) and b >= 0
+            waiting = started and self.ready(i) and b >= 0 and not self.free(self.alt_block(i))
             out.append(self.occupant[b] if waiting else -1)
         return out
 
@@ -212,12 +240,14 @@ class TrainSim:
         if exo is None:
             exo = self.draw()
         now = self.t * c.step_seconds
-        keys = ("entered", "arrived", "held", "blocked", "terminated", "missed")
+        keys = ("entered", "arrived", "held", "blocked", "terminated", "missed", "diverted")
         info = dict.fromkeys(keys, 0)
         T = len(self.pos)
         ready = [self.ready(i) for i in range(T)]
         deciding = [self.deciding(i) for i in range(T)]
         can_terminate = [self.can_terminate(i) for i in range(T)]
+        options = [(self.next_block(i), self.alt_block(i)) for i in range(T)]
+        free = [(self.free(b), self.free(a)) for b, a in options]
         claimed = set()
         for i in range(T):
             if not ready[i]:
@@ -234,28 +264,38 @@ class TrainSim:
                 continue
             b = self.next_block(i)
             if b < 0:  # leave the network from the last block
-                self.occupant[int(infra.route[i][self.pos[i]])] = -1
+                self.occupant[self.here(i)] = -1
                 self.pos[i] = int(infra.route_len[i])
                 self.arrival_delay[i] = max(0.0, now - infra.sched[i][self.pos[i]])
                 info["arrived"] += 1
                 continue
-            if not deciding[i] or b in claimed:
+            divert = int(actions[i]) == DIVERT and options[i][1] >= 0
+            if divert:
+                b = options[i][1]
+            if not deciding[i] or not free[i][divert] or b in claimed:
                 info["blocked"] += 1
                 continue
-            if int(actions[i]) != GO:
+            if int(actions[i]) != GO and not divert:
                 info["held"] += 1
                 continue
             if self.pos[i] != NOT_STARTED:
-                self.occupant[int(infra.route[i][self.pos[i]])] = -1
+                self.occupant[self.here(i)] = -1
             self.pos[i] += 1
+            p = self.pos[i]
+            if divert:  # onto the relief track, to the end of the section
+                q = p
+                while q < infra.route_len[i] and infra.alt_route[i][q] >= 0:
+                    self.relief[i][q] = True
+                    q += 1
             self.occupant[b] = i
             claimed.add(b)
-            p = self.pos[i]
             noise, incident = self.trip.noise[i][p], self.trip.incident[i][p]
-            seconds = infra.run[i][p] * self.block_speed[b] * noise + incident
+            run = infra.alt_run[i][p] if self.relief[i][p] else infra.run[i][p]
+            seconds = run * self.block_speed[b] * noise + incident
             ticks = max(1, math.ceil(seconds / c.step_seconds - 1e-9))
             self.remaining[i] = ticks + int(infra.dwell[i][p])
             info["entered"] += 1
+            info["diverted"] += divert
         for i in range(T):
             if self.remaining[i] > 0:
                 self.remaining[i] -= 1
@@ -280,8 +320,9 @@ class TrainSim:
         Head: not started, running (time left in its block), deciding,
         finished, progress along its route, time left in its block and
         projected delay (over DELAY_SCALE, capped at 1), express, westbound,
-        can terminate, and the calls it would miss if it did (over the
-        number of stations);
+        can terminate, the calls it would miss if it did (over the
+        number of stations), at a junction, and the relief block there is
+        free and open;
         then, for the next section it will enter: its next block is in it
         (it would enter the section now); a train going the other way is in
         it; one is deciding to enter it this tick ahead of this train in the
@@ -317,6 +358,8 @@ class TrainSim:
                 float(infra.direction[i]),
                 float(self.can_terminate(i)),
                 self.missed_calls(i) / self.config.n_stations if not self.finished(i) else 0.0,
+                float(self.alt_block(i) >= 0),
+                float(self.free(self.alt_block(i))),
             ]
             sec, d = target[i], infra.direction[i]
             inside = sec >= 0 and any(
@@ -334,7 +377,7 @@ class TrainSim:
             for k in range(1, LOOKAHEAD + 1):
                 p = self.pos[i] + k
                 if p < n:
-                    b = int(infra.route[i][p])
+                    b = self.block_at(i, p)
                     j = self.occupant[b]
                     same = j >= 0 and infra.direction[j] == infra.direction[i]
                     ahead += [1.0, float(j >= 0), float(same), float(self.block_open[b])]
@@ -380,7 +423,7 @@ class TrainSim:
                 out.append(-1)
                 continue
             sec = int(infra.section_of[self.next_block(i)])
-            here = int(infra.route[i][self.pos[i]]) if self.pos[i] != NOT_STARTED else -1
+            here = self.here(i)
             if sec >= 0 and here >= 0 and infra.section_of[here] == sec:
                 sec = -1  # already inside
             out.append(sec)
@@ -414,7 +457,7 @@ def section_reservation(sim):
             actions.append(GO)
             continue
         section = int(infra.section_of[b])
-        here = int(infra.route[i][sim.pos[i]]) if sim.pos[i] != NOT_STARTED else -1
+        here = sim.here(i)
         if here >= 0 and infra.section_of[here] == section:
             actions.append(GO)  # already inside: carry on
             continue
@@ -453,7 +496,7 @@ def route_setting(sim):
             continue
         b = sim.next_block(i)
         section = int(infra.section_of[b])
-        here = int(infra.route[i][sim.pos[i]]) if sim.pos[i] != NOT_STARTED else -1
+        here = sim.here(i)
         if section < 0 or (here >= 0 and infra.section_of[here] == section):
             continue
         if not infra.section_shared[section]:
@@ -461,6 +504,55 @@ def route_setting(sim):
         far = int(infra.far_platform[i][sim.pos[i] + 1])
         if far >= 0 and sim.occupant[far] >= 0:
             actions[i] = WAIT
+    return actions
+
+
+def reroute(sim, rule=route_setting):
+    """`rule`, plus: at a junction, take the relief track when the main one
+    is no good now.
+
+    A deciding train at a junction keeps `rule`'s GO if the main track's
+    next block is free and none of the section's main blocks is closed.
+    Otherwise it diverts if the relief track is usable: its first block
+    free, none of its blocks closed, no train going the other way in it or
+    diverting into it this tick ahead of this one, and (route setting, as
+    the relief track carries both directions) the platform at its far end
+    free. Otherwise it keeps `rule`'s action. So it diverts around a
+    closure, around a train in the main section, and to cross an oncoming
+    train between stations; it never weighs the relief track's slower
+    running against how soon the main track will clear.
+    """
+    actions = list(rule(sim))
+    infra = sim.infra
+    entering = {}  # relief section -> directions diverting into it this tick, so far
+    for i in range(len(sim.pos)):
+        a = sim.alt_block(i)
+        if a < 0 or not sim.deciding(i):
+            continue
+        q = sim.pos[i] + 1
+        span = [p for p in range(q, int(infra.route_len[i])) if infra.alt_route[i][p] >= 0]
+        span = span[: next((n for n, p in enumerate(span) if p != q + n), len(span))]
+        main_ok = sim.free(sim.next_block(i)) and all(
+            sim.block_open[int(infra.route[i][p])] for p in span
+        )
+        if actions[i] == GO and main_ok:
+            continue
+        section, d = int(infra.section_of[a]), infra.direction[i]
+        against = any(
+            j >= 0 and infra.section_of[blk] == section and infra.direction[j] != d
+            for blk, j in enumerate(sim.occupant)
+        )
+        against |= any(other != d for other in entering.get(section, []))
+        far = int(infra.far_platform[i][q])
+        usable = (
+            sim.free(a)
+            and all(sim.block_open[int(infra.alt_route[i][p])] for p in span)
+            and not against
+            and not (far >= 0 and sim.occupant[far] >= 0)
+        )
+        if usable:
+            actions[i] = DIVERT
+            entering.setdefault(section, []).append(d)
     return actions
 
 
@@ -562,12 +654,14 @@ def give_way_to_express(sim, rule=route_setting):
 
 def heuristic(sim):
     """The env's heuristic (`TrainEnv.heuristic`): route setting, giving way
-    to expresses where there are any, and terminating when stuck where the
-    config allows it."""
+    to expresses where there are any, rerouting where there are relief
+    tracks, and terminating when stuck where the config allows it."""
 
     def rule(sim):
         if sim.infra.express.any():
             return give_way_to_express(sim)
+        if (sim.infra.alt_route >= 0).any():
+            return reroute(sim)
         return route_setting(sim)
 
     if sim.config.terminate_penalty > 0:
