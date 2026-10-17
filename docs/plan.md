@@ -501,9 +501,9 @@ optimal and copies section reservation, but does not yet improve on it.
       (reroute onto a relief track with DIVERT, Phase 3). The return half
       of a short-turn needs vehicle circulation (backlog).
 - [ ] Switch disruptions on for elevator (car out of service) and bus
-      (road closure, breakdown). Bus road closures done (`bus/closure-v0`,
-      Result below). A car out of service and a bus breakdown are vehicle
-      failures, which the core process does not model yet (backlog).
+      (road closure, breakdown). Bus road closures and breakdowns done
+      (`bus/closure-v0`, `bus/breakdown-v0`, Result below). The elevator
+      (a car out of service) is still to do.
 - [x] Evaluation: in-distribution, shift (trained without, tested with),
       and CVaR at 10% of delay alongside the mean.
 
@@ -648,6 +648,21 @@ them so far is a better rule, not RL.
   anticipates the closure (e.g. holding buses upstream while the road is
   shut, so they do not all join the queue). That is headroom for a
   closure-aware rule or a learner.
+- **Bus breakdowns** (`BusConfig.breakdown`, `bus/breakdown-v0`). Vehicle
+  failures reuse the core process with buses in place of edges: a bus
+  goes down at random and is repaired after a random time; while down it
+  freezes (no running, boarding, alighting or departing) and is not
+  deciding. Observation: three more head fields per bus (broken down,
+  for how long, time to repair if observable), so `HEAD_FIELDS` 7 → 10.
+  `breakdown` is `peak` with 0.3 failures per bus-hour, 5 minutes on
+  average (about one an episode). Holding −1619 vs always-go −1633
+  (512 episodes): the rule's lead falls from 42 on `peak` to 13. Variants
+  that re-space for the buses still running (target headway × B / (B −
+  broken)), stop holding during a breakdown, or allow longer holds are
+  all within noise of it (1,024 episodes, ±4.5): with 3 buses a failure
+  removes a third of the capacity, and no holding rule recovers that.
+  The levers that would are out of this env's action space (a spare bus,
+  short-turning the bus behind).
 ### Phase 5: on-demand fleet
 
 - [ ] Env: grid graph, requests with OD, vehicle assignment + repositioning.
@@ -715,9 +730,10 @@ designed for.
   rule that prices the queue behind a blocked train (trains waiting for
   it × expected time left); a value baseline for TERMINATE from rollouts
   (DLA, Powell's fourth class).
-- Vehicle failures in `core.disruption` (a vehicle stops for a random
-  time): a lift car out of service, a bus breakdown, a train failure.
-  A closure-aware bus rule (hold upstream buses while a road is shut).
+- Vehicle failures for the lift (a car out of service) and the train (a
+  train failure), as done for buses. A closure-aware bus rule (hold
+  upstream buses while a road is shut). Bus response actions for
+  breakdowns: a spare bus, or short-turning the bus behind.
 - Route choice: general alternative routes on a graph (relief tracks
   only cover a parallel track of equal length; a diversion via other
   stations, skipping calls, needs per-route tables); an exact AND-OR

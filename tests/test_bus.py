@@ -99,6 +99,30 @@ def test_closed_edge_holds_buses_at_the_stop_before_it():
     assert not sim.at_stop[0]
 
 
+@pytest.mark.usefixtures("x64")
+def test_a_broken_down_bus_freezes_until_repaired():
+    from transit_bench.core.disruption import DisruptionConfig
+
+    fail = DisruptionConfig(mode="markov", rate_per_hour=1.0, mean_seconds=60.0)
+    c = quiet(n_buses=2, breakdown=fail)
+    env, sim = BusEnv(c), BusSim(c)
+    state, _ = env.reset(jax.random.key(0))
+    arrivals = np.zeros((c.n_stops, c.n_stops), int)
+    # Bus 0 breaks down at the end of the first tick, for 60 s; bus 1 never.
+    breaks = Exogenous(arrivals, np.ones(2), None, None, np.array([0.0, 1.0]), np.full(2, 60.0))
+    calm = Exogenous(arrivals, np.ones(2), None, None, np.ones(2), np.zeros(2))
+    for t in range(12):
+        exo = breaks if t == 0 else calm
+        sim.step([HOLD, GO] if t == 0 else [GO, GO], exo)
+        state, _ = env.step(state, jnp.array([HOLD, GO] if t == 0 else [GO, GO]), exo)
+        if 1 <= t < 6:
+            assert sim.broken(0) and not sim.deciding(0)
+            assert sim.at_stop[0] and sim.stop[0] == 0  # frozen at its stop
+        np.testing.assert_array_equal(state.stop, sim.stop)
+        np.testing.assert_array_equal(state.at_stop, sim.at_stop)
+    assert not sim.broken(0) and not sim.at_stop[0]  # repaired and gone
+
+
 def test_a_scripted_road_closure_holds_buses_then_lets_them_go():
     from transit_bench.core.disruption import DisruptionConfig
 

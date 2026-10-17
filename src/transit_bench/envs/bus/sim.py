@@ -14,6 +14,9 @@ Model (see docs/formulation.md, "Bus"):
   time; the process moves on at the end of each tick, so the next
   decisions see the state they act under. A bus already on an edge keeps
   the running time it drew when it left.
+- Breakdowns (`breakdown`, the same process over buses instead of edges):
+  a broken-down bus freezes where it is (no running, boarding, alighting
+  or departing) until it is repaired, and is not deciding meanwhile.
 - Passengers arrive at each stop as a Poisson process (rate scaled over the
   episode by the demand profile), to a destination uniform over the other
   stops. Waiting passengers are counts per (stop, destination); boarding
@@ -53,7 +56,7 @@ DEMAND_PROFILES = ("flat", "peak")
 # "peak": keyframes of (episode fraction, demand factor), linearly interpolated.
 _PEAK_KEYFRAMES = ((0.0, 0.5), (0.5, 1.5), (1.0, 0.5))
 NEVER = -1e9  # last_depart before any bus has left a stop
-HEAD_FIELDS = 7  # per bus in the observation
+HEAD_FIELDS = 10  # per bus in the observation
 STOP_FIELDS = 6  # per stop offset in the observation
 
 
@@ -75,12 +78,17 @@ class BusConfig:
     max_hold_seconds: float = 120.0
     # Edges going down at random (closed or slowed); none by default.
     disruption: DisruptionConfig = DisruptionConfig()
+    # Buses breaking down at random (each one an "edge" of the process,
+    # which must close it: speed 0); none by default.
+    breakdown: DisruptionConfig = DisruptionConfig()
 
     def __post_init__(self):
         if self.demand not in DEMAND_PROFILES:
             raise ValueError(f"demand must be one of {DEMAND_PROFILES}, got {self.demand!r}")
         if self.n_stops < 2 or self.n_buses < 1 or self.capacity < 1:
             raise ValueError("need at least 2 stops, 1 bus and a capacity of 1")
+        if self.breakdown.speed != 0 or self.breakdown.mode == "scripted":
+            raise ValueError("breakdowns stop the bus (speed 0) and are random")
 
     @property
     def headway(self):
@@ -117,6 +125,12 @@ PRESETS["closure"] = replace(
     PRESETS["peak"],
     disruption=DisruptionConfig(mode="markov", rate_per_hour=0.1, mean_seconds=300.0),
 )
+# Breakdowns on `peak`: each bus fails 0.3 times an hour (about one failure
+# an episode across the 3 buses), for 5 minutes on average.
+PRESETS["breakdown"] = replace(
+    PRESETS["peak"],
+    breakdown=DisruptionConfig(mode="markov", rate_per_hour=0.3, mean_seconds=300.0),
+)
 
 
 class Exogenous(NamedTuple):
@@ -128,6 +142,9 @@ class Exogenous(NamedTuple):
     # None: no outage starts this tick.
     onset: np.ndarray | None = None
     duration: np.ndarray | None = None
+    # (buses,) the same for breakdowns.
+    fail_onset: np.ndarray | None = None
+    fail_duration: np.ndarray | None = None
 
 
 def demand_factor(demand, episode_fraction):
@@ -188,6 +205,7 @@ class BusSim:
         self.edge_open = np.ones(c.n_stops, bool)
         self.edge_speed = np.ones(c.n_stops)
         self.disruption = disruption.initial_np(c.n_stops)
+        self.failure = disruption.initial_np(c.n_buses)
         return self.observe()
 
     def draw(self):
@@ -200,7 +218,8 @@ class BusSim:
         else:
             noise = np.ones(c.n_buses)
         d = disruption.draw_np(c.disruption, self.rng, c.n_stops)
-        return Exogenous(arrivals, noise, d.onset, d.duration)
+        f = disruption.draw_np(c.breakdown, self.rng, c.n_buses)
+        return Exogenous(arrivals, noise, d.onset, d.duration, f.onset, f.duration)
 
     # -- dynamics ------------------------------------------------------------
 
@@ -212,7 +231,12 @@ class BusSim:
         space = self.config.capacity - sum(self.onboard[b]) + self._alightable(b)
         return min(space, sum(self.waiting[s]))
 
+    def broken(self, b):
+        return bool(self.failure.down[b])
+
     def deciding(self, b):
+        if self.broken(b):
+            return False
         return self.at_stop[b] and self._alightable(b) == 0 and self._boardable(b) == 0
 
     def step(self, actions, exo=None):
@@ -229,6 +253,8 @@ class BusSim:
             "gap_sq_sum": 0.0,
         }
         for b in range(c.n_buses):
+            if self.broken(b):
+                continue
             if not self.at_stop[b]:
                 self.remaining[b] -= 1
                 if self.remaining[b] <= 0:
@@ -271,6 +297,7 @@ class BusSim:
                 self.onboard[b][d] += take
                 n_board -= take
         self._advance_disruption(exo, now)
+        self._advance_breakdowns(exo, now)
         self.t += 1
         waiting = sum(map(sum, self.waiting))
         onboard = sum(map(sum, self.onboard))
@@ -292,7 +319,25 @@ class BusSim:
         self.disruption = disruption.step_np(c, self.disruption, draw, eligible, now, dt)
         self.edge_open, self.edge_speed = disruption.edge_effect_np(c, self.disruption)
 
+    def _advance_breakdowns(self, exo, now):
+        c = self.config.breakdown
+        if c.mode == "none":
+            return
+        n = self.config.n_buses
+        onset = np.ones(n) if exo.fail_onset is None else exo.fail_onset
+        duration = np.zeros(n) if exo.fail_duration is None else exo.fail_duration
+        draw = disruption.DisruptionDraw(onset, duration)
+        dt = self.config.step_seconds
+        self.failure = disruption.step_np(c, self.failure, draw, np.ones(n, bool), now, dt)
+
     # -- observation ---------------------------------------------------------
+
+    def _failure_fields(self, b):
+        f, c = self.failure, self.config
+        if not f.down[b]:
+            return [0.0, 0.0, 0.0]
+        left = min(f.remaining[b] / c.headway, 1.0) if c.breakdown.observe_remaining else 0.0
+        return [1.0, min(f.elapsed[b] / c.headway, 1.0), left]
 
     def position(self, b):
         """Bus b's position along the loop, in nominal seconds."""
@@ -307,7 +352,9 @@ class BusSim:
 
         Head: at a stop, deciding, load, gap to the bus ahead and behind (in
         headways, capped at 2, halved), time held (in headways, capped at 1),
-        progress along the current edge. Then for each stop from that one on
+        progress along the current edge, broken down, time since it broke
+        down and time until it is repaired (in headways, capped at 1; the
+        last 0 unless the breakdown config makes it observable). Then for each stop from that one on
         round the loop: people waiting there and on board for there (over the
         capacity, capped at 1), time since a bus last left it (in
         headways, capped at 2, halved; 1 if none has), and the edge out of
@@ -346,6 +393,7 @@ class BusSim:
                 min(behind / h, 2.0) / 2,
                 min(self.hold[b] * c.step_seconds / h, 1.0),
                 progress,
+                *self._failure_fields(b),
             ]
             ref = self.stop[b] if self.at_stop[b] else (self.stop[b] + 1) % c.n_stops
             stops = []

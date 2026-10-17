@@ -53,6 +53,7 @@ class BusState(NamedTuple):
     last_depart: jax.Array  # (stops,) float: seconds, NEVER if no bus has left yet
     edges: EdgeState
     disruption: disruption.DisruptionState  # per edge: down, elapsed, remaining
+    failure: disruption.DisruptionState  # per bus: broken down, elapsed, remaining
     t: jax.Array  # () int
     key: jax.Array
 
@@ -113,6 +114,7 @@ class BusEnv:
             last_depart=jnp.full(stops, NEVER, f),
             edges=nominal(self.network, f),
             disruption=disruption.initial(stops, f),
+            failure=disruption.initial(buses, f),
             t=jnp.zeros((), jnp.int32),
             key=key,
         )
@@ -159,7 +161,8 @@ class BusEnv:
             noise = jnp.ones(c.n_buses, f)
         # A folded key, so the other draws are as they were before disruptions.
         d = disruption.draw(c.disruption, jax.random.fold_in(key, 2), n, f)
-        return Exogenous(arrivals, noise, d.onset, d.duration)
+        fail = disruption.draw(c.breakdown, jax.random.fold_in(key, 3), c.n_buses, f)
+        return Exogenous(arrivals, noise, d.onset, d.duration, fail.onset, fail.duration)
 
     # -- dynamics ------------------------------------------------------------
 
@@ -170,7 +173,7 @@ class BusEnv:
         alightable = state.onboard[buses, state.stop]
         space = c.capacity - state.onboard.sum(axis=1) + alightable
         boardable = jnp.minimum(space, state.waiting[state.stop].sum(axis=1))
-        return state.at_stop & (alightable == 0) & (boardable == 0)
+        return state.at_stop & (alightable == 0) & (boardable == 0) & ~state.failure.down
 
     def active_agents(self, state):
         """Buses whose action takes effect this step: the deciding ones."""
@@ -255,8 +258,16 @@ class BusEnv:
         noise = jnp.asarray(exo.noise, state.last_depart.dtype)
         info = self._info()
         for b in range(c.n_buses):  # in bus order: lower buses board first
-            state, info = self._bus(state, b, actions[b], noise[b], now, info)
+            moved, moved_info = self._bus(state, b, actions[b], noise[b], now, info)
+            frozen = state.failure.down[b]  # a broken-down bus does nothing
+
+            def keep(new, old, frozen=frozen):
+                return jnp.where(frozen, old, new)
+
+            state = jax.tree.map(keep, moved, state)
+            info = jax.tree.map(keep, moved_info, info)
         state = self._advance_disruption(state, exo, now)
+        state = self._advance_breakdowns(state, exo, now)
         state = state._replace(t=state.t + 1)
         waiting = state.waiting.sum()
         onboard = state.onboard.sum()
@@ -282,6 +293,19 @@ class BusEnv:
         is_open, speed = disruption.edge_effect(c, d)
         return state._replace(disruption=d, edges=EdgeState(open=is_open, speed=speed))
 
+    def _advance_breakdowns(self, state, exo, now):
+        """As sim.BusSim._advance_breakdowns: at the end of the tick."""
+        c = self.config.breakdown
+        if c.mode == "none":
+            return state
+        n, f = self.config.n_buses, now.dtype
+        onset = jnp.ones(n, f) if exo.fail_onset is None else jnp.asarray(exo.fail_onset, f)
+        duration = jnp.zeros(n, f) if exo.fail_duration is None else exo.fail_duration
+        draw = disruption.DisruptionDraw(onset, jnp.asarray(duration, f))
+        dt = self.config.step_seconds
+        failure = disruption.step(c, state.failure, draw, jnp.ones(n, bool), now, dt)
+        return state._replace(failure=failure)
+
     # -- observation ---------------------------------------------------------
 
     def positions(self, state):
@@ -304,6 +328,10 @@ class BusEnv:
         since = jnp.where(last <= NEVER, 1.0, jnp.minimum((now - last) / h, 2.0) / 2)
         f = p.dtype
         progress = jnp.where(state.at_stop, 0.0, 1.0 - state.remaining.astype(f) / state.trip)
+        fl = state.failure
+        broken_for = jnp.where(fl.down, jnp.minimum(fl.elapsed / h, 1.0), 0.0)
+        repair = jnp.minimum(fl.remaining / h, 1.0)
+        repair = jnp.where(fl.down & c.breakdown.observe_remaining, repair, 0.0)
         head = jnp.stack(
             [
                 state.at_stop.astype(p.dtype),
@@ -313,6 +341,9 @@ class BusEnv:
                 jnp.minimum(behind / h, 2.0) / 2,
                 jnp.minimum(state.hold.astype(f) * c.step_seconds / h, 1.0),
                 progress,
+                fl.down.astype(f),
+                broken_for,
+                repair,
             ],
             axis=1,
         ).astype(jnp.float32)
