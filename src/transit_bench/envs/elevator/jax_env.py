@@ -47,6 +47,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from transit_bench.core import demand
+from transit_bench.core.obs import one_hot  # noqa: F401 (re-exported)
 from transit_bench.core.types import TimeStep
 from transit_bench.envs.elevator.gym_env import (
     RELATIVE_FLOOR_FIELDS,
@@ -169,6 +170,9 @@ class ElevatorEnv:
         self.max_steps = max_steps
         self.n_agents = c.n_lifts
         self.observe_direction = observe_direction
+        # The "relative" observation is one block per lift (for MAPPO).
+        self.per_agent_obs = obs_type == "relative"
+        self.observation_nvec = None  # set below for "custom"
         if action_mode == "target":
             self.n_actions = c.n_floors * (2 if c.hall_calls else 1)
         else:
@@ -497,6 +501,12 @@ class ElevatorEnv:
 
     # -- env API -------------------------------------------------------------
 
+    def heuristic(self):
+        """Collective control (`heuristic.CollectiveControl`), as a JAX policy."""
+        from transit_bench.envs.elevator.heuristic import CollectiveControl
+
+        return CollectiveControl(self)
+
     def potential(self, state):
         shaping = self.reward_shaping
         if shaping is None or not shaping.progress:
@@ -626,18 +636,3 @@ class ElevatorEnv:
 
         windows = jax.vmap(window)(wanted, others, floors)
         return jnp.concatenate([head, windows], axis=1).ravel()
-
-
-def one_hot(obs, nvec):
-    """SB3's preprocessing of a MultiDiscrete observation: one one-hot per entry.
-
-    `obs` (..., len(nvec)) of integers -> (..., sum(nvec)) float32.
-    """
-    offsets = jnp.asarray(np.concatenate([[0], np.cumsum(nvec)[:-1]]))
-    index = obs.astype(jnp.int32) + offsets
-
-    def encode(index):
-        return jnp.zeros(int(np.sum(nvec)), jnp.float32).at[index].set(1.0)
-
-    flat = index.reshape(-1, index.shape[-1])
-    return jax.vmap(encode)(flat).reshape(*obs.shape[:-1], -1)
