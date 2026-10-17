@@ -115,16 +115,47 @@ the JAX env alone steps ~0.68M env steps/s).
       what each covers, so the suite's niche is stated with evidence.
       Done: [related-work.md](related-work.md), and the maths in
       [formulation.md](formulation.md).
-- [ ] `pyproject.toml` with uv: Python 3.12, `jax` / `jax-cuda` groups
-      (CUDA 12 for the GTX 1080), optional `torch` cpu/cuda groups for the
-      SB3 wrapper, `dev` group (pytest, ruff). Package `transit_bench`.
-- [ ] pytest with a `slow` marker, ruff, GitHub Actions CI (CPU only).
-- [ ] Decide the core's state layout and the env API; write them down here.
+- [x] `pyproject.toml` with uv: Python 3.12, `jax-cuda` group
+      (CUDA 12 for the GTX 1080), `dev` group (pytest, ruff, scipy). Package
+      `transit_bench`. JAX and optax are core dependencies, since every env
+      is JAX; the `torch` groups wait for the SB3 wrapper (backlog).
+- [x] pytest with a `slow` marker, ruff, GitHub Actions CI (CPU only).
+- [x] Decide the core's state layout and the env API; write them down here.
+
+**Result.** The core is the API plus the shared machinery; each env keeps
+its own state layout.
+
+- **API** (`core/types.py`): `reset(key) -> (state, TimeStep)`,
+  `step(state, action) -> (state, TimeStep)`, with
+  `TimeStep(observation, reward, terminated, truncated, info)`. `info` holds
+  domain metrics with the same keys at reset and every step, so it scans.
+  Actions are `(n_agents,)` integers with `n_actions` choices each; the
+  observation is flat (`observation_size`). Env objects hold only static
+  config; all state is in a `NamedTuple`.
+- **Batching** (`core/vec.py`): `make_vec_env(env, n)` with auto-reset and
+  `terminal_obs`, written once for every env. Reset keys live in the
+  `VecState`, not in each env's state.
+- **Demand** (`core/demand.py`): the loop-free Poisson OD draw from the old
+  repo (Poisson total by inverse CDF, then origin and destination per slot)
+  as env-independent functions.
+- **Registry** (`registry.py`): `make("elevator/full-v0")`.
+- **State layout: per env, not one universal struct.** A shared
+  vehicles-on-a-graph struct would have forced the elevator's per-lift
+  kinematics and per-floor queues into a generic shape for no gain, and
+  broken parity. The plan's `κ_e(t)` / `σ_e(t)` arrays arrive with the
+  network module when the bus env needs edges (phase 2), and disruptions
+  write to those (phase 4). Revisit once two graph envs exist and the
+  common part is visible, rather than guessing it now.
 
 ### Phase 1: elevator port (regression check)
 
-- [ ] Port the Python reference (`building.py`) and the JAX env onto the core.
-- [ ] Parity test: new JAX env against new Python reference, every preset.
+- [x] Port the Python reference (`building.py`) and the JAX env onto the core.
+      `envs/elevator/{sim,gym_env,jax_env}.py`; the "box" observation was
+      dropped (only "relative", used for learning, and "custom", read by the
+      heuristic, remain).
+- [x] Parity test: new JAX env against new Python reference, every preset.
+      `tests/test_elevator_jax.py`: 5 presets × 5 option sets, 2 episodes
+      each, exact observations in float64.
 - [ ] Parity test against the old repo's env (same seed, same trajectory),
       run once and recorded, so the port is known to match before diverging.
 - [ ] Port `CollectivePolicy`, JAX PPO + MAPPO and imitation.
