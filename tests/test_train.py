@@ -13,6 +13,7 @@ from transit_bench.envs.train import PRESETS, TrainConfig, TrainEnv
 from transit_bench.envs.train.heuristic import FirstComeFirstServed, SectionReservation
 from transit_bench.envs.train.infra import EAST, WEST, build
 from transit_bench.envs.train.sim import (
+    BRIDGE,
     DIVERT,
     GO,
     TERMINATE,
@@ -223,9 +224,9 @@ def replay(preset, policy, seed):
 @pytest.mark.parametrize("preset", PRESETS)
 def test_jax_matches_python_step_for_step(preset):
     for seed in range(2):
-        # Four actions everywhere: TERMINATE without a terminate_penalty, and
-        # DIVERT away from a junction, hold as WAIT does.
-        replay(preset, lambda sim, rng: rng.integers(4, size=len(sim.pos)), seed)
+        # Five actions everywhere: TERMINATE without a terminate_penalty,
+        # DIVERT away from a junction and BRIDGE without buses hold as WAIT does.
+        replay(preset, lambda sim, rng: rng.integers(5, size=len(sim.pos)), seed)
         replay(preset, lambda sim, rng: first_come_first_served(sim), seed)
         replay(preset, lambda sim, rng: section_reservation(sim), seed)
         replay(preset, lambda sim, rng: route_setting(sim), seed)
@@ -411,8 +412,7 @@ def responsive(**changes):
         trains_per_direction=1,
         running_cv=0,
         incident_probability=0,
-        terminate_penalty=5.0,
-        **changes,
+        **({"terminate_penalty": 5.0} | changes),
     )
 
 
@@ -567,3 +567,34 @@ def test_reroute_goes_around_a_closed_block_where_route_setting_waits():
     diverted, done_divert = run(env, Reroute(env), key)
     assert done_wait and done_divert
     assert float(diverted) < float(waited) - 20  # the eastbound train waits out ~25 minutes
+
+
+# -- bus bridging ----------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("x64")
+def test_bridging_a_cancelled_train_is_cheaper_and_keeps_the_bus_busy():
+    c = responsive(terminate_penalty=15.0, bridge_buses=1)
+    sim = TrainSim(c)
+    env = TrainEnv(c)
+    assert env.n_actions == 5
+    state, _ = env.reset(jax.random.key(0), sim.trip)
+    calm(sim)
+    state = state._replace(trip=Trip(jnp.asarray(sim.trip.noise), jnp.asarray(sim.trip.incident)))
+    assert sim.can_bridge(0)
+    cost, back = sim.bridge_plan(0)
+    jcost, jback = env.bridge_plan(state)
+    assert float(jcost[0]) == pytest.approx(cost) and int(jback[0]) == back
+    # The bus drives 2 stations from the depot to the origin, then serves
+    # all 5 calls late, but each costs at most the penalty.
+    assert 0 < cost < 15.0 * 5
+    exo = Exogenous(np.ones(sim.infra.n_blocks), np.zeros(sim.infra.n_blocks))
+    _, reward, _, _, info = sim.step([BRIDGE, GO], exo)
+    state, ts = env.step(state, jnp.array([BRIDGE, GO]), exo)
+    assert info["bridged"] == 1 and int(ts.info["bridged"]) == 1
+    assert reward == pytest.approx(-cost) and float(ts.reward) == pytest.approx(-cost)
+    assert sim.bus_free == [back] and int(state.bus_free[0]) == back
+    # The only bus is out, so the westbound train cannot bridge when due.
+    while not sim.can_terminate(1):
+        sim.step([GO, WAIT], exo)
+    assert not sim.can_bridge(1)

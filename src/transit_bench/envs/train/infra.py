@@ -74,6 +74,13 @@ class TrainConfig:
     # its running times relative to the main track's.
     relief_sections: tuple = ()
     relief_slowdown: float = 1.25
+    # Bus bridging: a pool of replacement buses at the depot station (-1:
+    # the middle one), on a road alongside the line `bus_slowdown` times
+    # slower than a stopping train. Enables the BRIDGE action (needs
+    # terminate_penalty > 0).
+    bridge_buses: int = 0
+    bus_slowdown: float = 1.5
+    bridge_depot: int = -1
 
     def __post_init__(self):
         if self.n_stations < 2 or self.blocks_per_section < 1:
@@ -86,6 +93,20 @@ class TrainConfig:
             raise ValueError("relief_sections must name sections 0 .. n_stations - 2")
         if self.relief_slowdown < 1:
             raise ValueError("relief_slowdown must be >= 1")
+        if self.bridge_buses < 0 or (self.bridge_buses and self.terminate_penalty <= 0):
+            raise ValueError("bridge_buses needs terminate_penalty > 0")
+        if not -1 <= self.bridge_depot < self.n_stations:
+            raise ValueError("bridge_depot must be a station, or -1 for the middle one")
+
+    @property
+    def depot(self):
+        return self.n_stations // 2 if self.bridge_depot < 0 else self.bridge_depot
+
+    @property
+    def road_ticks(self):
+        """Ticks for a bus to drive between neighbouring stations."""
+        seconds = self.bus_slowdown * self.blocks_per_section * self.section_block_seconds
+        return math.ceil(seconds / self.step_seconds - 1e-9)
 
     @property
     def n_trains(self):
@@ -116,6 +137,9 @@ PRESETS["response"] = replace(
 # middle sections, 25% slower. A train can divert onto it around a closed
 # block, or to cross an oncoming train between stations.
 PRESETS["junction"] = replace(PRESETS["blockage"], relief_sections=(1, 2))
+# Bus bridging: `response` on a line where a missed call costs 15 minutes
+# (a 30-minute headway), with 2 replacement buses at the middle station.
+PRESETS["bridge"] = replace(PRESETS["response"], terminate_penalty=15.0, bridge_buses=2)
 
 
 class Infra(NamedTuple):

@@ -768,9 +768,63 @@ designed for.
 
 ### Phase 7: coupled modes (stretch)
 
-- [ ] Bus bridging: when a rail block closes, buses run a replacement
+- [x] Bus bridging: when a rail block closes, buses run a replacement
       service between the affected stations. Train and bus envs share one
       core state. No paper found does short-turning and bridging jointly.
+      Done as a first step: buses as a shared resource inside the train
+      env (`bridge_buses`, BRIDGE, `train/bridge-v0`), not a coupling of
+      the two envs' states (Result below).
+
+**Result.** Short-turning and bridging decided jointly, by one rule, on one
+line; bridging pays when missed calls are dear.
+
+- **Model.** A pool of replacement buses waits at the depot (the middle
+  station). BRIDGE ends a trip as TERMINATE does and sends the
+  lowest-numbered free bus: it drives from the depot to where the train
+  stopped (its origin, for a cancellation), then through the train's
+  remaining calls on a road alongside the line, `bus_slowdown` (1.5)
+  times slower than a stopping train, dwelling at each. Each call costs
+  the bus's lateness there against the train's timetable, capped at the
+  missed-call penalty, and the bus is busy until it is back at the
+  depot. Bus travel has no noise, so a bridge's cost and the bus's return
+  are known when it is sent (`bridge_plan`). Observation: can bridge,
+  and the bridge's cost (`HEAD_FIELDS` 17 → 19). JAX matches Python step
+  for step under random five-action play and the rule.
+- **Why not couple the bus env.** The bus env is a loop of stops with
+  passengers and headway holding; a replacement service is a shuttle
+  along the rail line, timed against the train timetable. Sharing one
+  core state between the two envs would mean a common clock, passenger
+  model and network, which is the real Phase 7 design question; the
+  resource model gets the decision (when to end a trip, with or without
+  a bus) without it.
+- **Rule.** `TerminateWhenStuck` now ends a trip the cheaper way: BRIDGE
+  if a bus is free and bridging costs less than the penalty, else
+  TERMINATE; free buses go to trains in index order, and the stopping
+  threshold uses the cheaper cost.
+- **Results** (2,048 episodes, seed 7; cost per train in minutes; the
+  same scenarios for every row, since only the bus pool differs):
+
+  | Policy | Penalty 5 min/call | Penalty 15 (`bridge`) |
+  |---|---|---|
+  | Route setting | 4.98 / CVaR 25.8 | 4.98 / 25.8 |
+  | Terminate, no buses | 3.52 / 15.6 | 4.67 / 22.5 |
+  | Terminate + 1 bus | 3.44 / 15.3 | 4.01 / 19.2 |
+  | **Terminate + 2 buses** | 3.40 / 15.1 | **3.75 / 17.8** |
+  | Terminate + 4 buses | 3.39 / 15.0 | 3.67 / 17.2 |
+
+- **What was learned.**
+  - Where a missed call is dear (a 30-minute headway), terminating alone
+    barely helps (4.98 → 4.67): the penalty outweighs most waits. Two
+    buses make it 20% better (3.75) and terminate more often (0.40 →
+    0.53 trains per episode), because a bridged call costs
+    the bus's lateness, not the full penalty: buses change *when* to
+    short-turn, not just what it costs. That is the joint decision.
+  - Returns diminish fast: the first bus saves 0.66 min per train, the
+    second 0.26, the third and fourth 0.08 between them. Presumably
+    because outages rarely overlap on one line (not measured).
+  - At a 5-minute penalty buses add little (3.52 → 3.40): the cap means a
+    bridged call can save at most 5 minutes, and a bus that has to come
+    from the depot is often later than that.
 
 ## Backlog
 

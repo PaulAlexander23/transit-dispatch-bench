@@ -56,6 +56,11 @@ Baselines over 512 episodes each (seed 0). Score: random = 0, the env's heuristi
 | `train/blockage-v0` | first come first served | -68.2 ± 4.1 | 0.45 | delay/train 8.53 min, CVaR10 34.25 min, deadlocks 0.373 |
 | `train/blockage-v0` | section reservation | -34.3 ± 2.9 | 0.87 | delay/train 4.29 min, CVaR10 26.66 min, deadlocks 0.109 |
 | `train/blockage-v0` | heuristic | -23.7 ± 1.7 | 1.00 | delay/train 2.96 min, CVaR10 14.96 min, deadlocks 0.002 |
+| `train/bridge-v0` | random | -483.1 ± 1.8 | 0.00 | cost/train 60.38 min, CVaR10 68.10 min, deadlocks 0.006, bridged/ep 2.03, terminated/ep 7.88 |
+| `train/bridge-v0` | first come first served | -76.8 ± 4.3 | 0.90 | cost/train 9.60 min, CVaR10 34.84 min, deadlocks 0.369, bridged/ep 0.00, terminated/ep 0.00 |
+| `train/bridge-v0` | section reservation | -46.5 ± 3.3 | 0.96 | cost/train 5.81 min, CVaR10 30.30 min, deadlocks 0.129, bridged/ep 0.00, terminated/ep 0.00 |
+| `train/bridge-v0` | route setting | -37.9 ± 2.7 | 0.98 | cost/train 4.74 min, CVaR10 24.99 min, deadlocks 0.006, bridged/ep 0.00, terminated/ep 0.00 |
+| `train/bridge-v0` | heuristic | -30.3 ± 2.0 | 1.00 | cost/train 3.78 min, CVaR10 18.58 min, deadlocks 0.002, bridged/ep 0.42, terminated/ep 0.44 |
 | `train/junction-v0` | random | -234.9 ± 2.1 | 0.00 | delay/train 29.37 min, CVaR10 36.30 min, deadlocks 0.990, diverted/ep 4.95 |
 | `train/junction-v0` | first come first served | -68.2 ± 4.1 | 0.75 | delay/train 8.53 min, CVaR10 34.25 min, deadlocks 0.371, diverted/ep 0.00 |
 | `train/junction-v0` | section reservation | -35.8 ± 3.0 | 0.90 | delay/train 4.48 min, CVaR10 27.61 min, deadlocks 0.000, diverted/ep 0.00 |

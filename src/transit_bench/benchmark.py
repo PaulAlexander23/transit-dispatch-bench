@@ -90,6 +90,8 @@ def domain_metrics(env_id, env, rewards, info):
         ]
         if env.has_relief:
             out.append(("diverted/ep", f"{info['diverted'].sum(axis=0).mean():.2f}"))
+        if env.config.bridge_buses:
+            out.append(("bridged/ep", f"{info['bridged'].sum(axis=0).mean():.2f}"))
         if penalty:
             out.append(("terminated/ep", f"{info['terminated'].sum(axis=0).mean():.2f}"))
         return out

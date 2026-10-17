@@ -7,7 +7,7 @@ The Python references are `sim.first_come_first_served`,
 
 import jax.numpy as jnp
 
-from transit_bench.envs.train.sim import DIVERT, GO, NOT_STARTED, TERMINATE, WAIT
+from transit_bench.envs.train.sim import BRIDGE, DIVERT, GO, NOT_STARTED, TERMINATE, WAIT
 
 
 def section_occupancy(env, state):
@@ -183,12 +183,27 @@ class TerminateWhenStuck:
         else:
             left = jnp.full(T, c.disruption.mean_seconds)
         missed = env.missed_calls(state)
-        stuck = can & closed & (self.factor * left > 60 * c.terminate_penalty * missed)
-        actions = jnp.where(stuck, TERMINATE, actions)
+        penalty = 60 * c.terminate_penalty * missed
+        can_bridge = env.can_bridge(state)
+        bridged = 60 * env.bridge_plan(state)[0]
+        buses = (state.bus_free <= state.t).sum(dtype=jnp.int32)
+
+        def end(i, buses):
+            """The cheaper way to end train i's trip: (action, cost in seconds)."""
+            use = (buses > 0) & can_bridge[i] & (bridged[i] < penalty[i])
+            return jnp.where(use, BRIDGE, TERMINATE), jnp.where(use, bridged[i], penalty[i])
+
+        for i in range(T):  # buses are handed out in train order
+            action, cost = end(i, buses)
+            go = can[i] & closed[i] & (self.factor * left[i] > cost)
+            actions = actions.at[i].set(jnp.where(go, action, actions[i]))
+            buses = buses - (go & (action == BRIDGE))
         dead = env.deadlocked(state) & can
         score = jnp.where(dead, missed * T + jnp.arange(T), jnp.iinfo(jnp.int32).max)
         pick = jnp.argmin(score)
-        actions = actions.at[pick].set(jnp.where(dead.any(), TERMINATE, actions[pick]))
+        ended = (actions[pick] == TERMINATE) | (actions[pick] == BRIDGE)
+        action, _ = end(pick, buses)
+        actions = actions.at[pick].set(jnp.where(dead.any() & ~ended, action, actions[pick]))
         return carry, actions.astype(jnp.int32)
 
 

@@ -19,7 +19,8 @@ core process (as are vehicle breakdowns, on `bus/breakdown-v0` and
 `bus/closure-v0` and `train/blockage-v0` switch them on, and `train/response-v0`
 adds a TERMINATE action (cancel or short-turn a train, at a cost per missed
 call). `train/junction-v0` adds route choice: relief tracks alongside two
-sections, and a DIVERT action to take them.
+sections, and a DIVERT action to take them. `train/bridge-v0` adds
+replacement buses: BRIDGE ends a trip and sends a bus to serve its calls.
 
 ```sh
 uv sync --group jax-cuda            # or plain `uv sync` for CPU JAX
