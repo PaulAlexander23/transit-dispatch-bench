@@ -99,6 +99,24 @@ def test_closed_edge_holds_buses_at_the_stop_before_it():
     assert not sim.at_stop[0]
 
 
+def test_a_scripted_road_closure_holds_buses_then_lets_them_go():
+    from transit_bench.core.disruption import DisruptionConfig
+
+    d = DisruptionConfig(mode="scripted", scripted=((0, 0.0, 60.0),))
+    c = quiet(n_buses=1, disruption=d)
+    sim = BusSim(c)
+    sim.step([HOLD], no_draw(c))  # the closure takes effect at the end of this tick
+    obs = sim.step([GO], no_draw(c))[0]
+    assert sim.at_stop[0] and sim.stop[0] == 0 and not sim.edge_open[0]
+    # The first stop's fields (from offset HEAD_FIELDS): waiting, on board, since, down.
+    from transit_bench.envs.bus.sim import HEAD_FIELDS
+
+    assert obs[HEAD_FIELDS + 3] == 1.0
+    for _ in range(6):
+        sim.step([GO], no_draw(c))
+    assert not sim.at_stop[0]  # reopened after 60 s
+
+
 def test_departure_gaps_are_recorded_at_each_stop():
     c = quiet(n_buses=2, n_stops=4)
     sim = BusSim(c)

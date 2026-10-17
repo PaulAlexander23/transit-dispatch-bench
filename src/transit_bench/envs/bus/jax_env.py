@@ -12,8 +12,8 @@ Same dynamics, observation and reward as `sim.BusSim`; given the same
   through a loop over buses that is unrolled when traced. Boarding "nearest
   destination first" is a cumulative sum over the stop's row of waiting
   counts, rolled to start after the stop.
-- Edges carry a `core.network.EdgeState` (open, speed) in the state, the
-  hook for disruptions.
+- Edges carry a `core.network.EdgeState` (open, speed) in the state, set
+  by the disruption process (`core.disruption`) at the end of each tick.
 """
 
 from typing import NamedTuple
@@ -22,7 +22,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from transit_bench.core import demand
+from transit_bench.core import demand, disruption
 from transit_bench.core.network import EdgeState, nominal
 from transit_bench.core.types import TimeStep
 from transit_bench.envs.bus.sim import (
@@ -52,6 +52,7 @@ class BusState(NamedTuple):
     waiting: jax.Array  # (stops, stops) int: passengers per origin, destination
     last_depart: jax.Array  # (stops,) float: seconds, NEVER if no bus has left yet
     edges: EdgeState
+    disruption: disruption.DisruptionState  # per edge: down, elapsed, remaining
     t: jax.Array  # () int
     key: jax.Array
 
@@ -111,6 +112,7 @@ class BusEnv:
             waiting=jnp.zeros((stops, stops), jnp.int32),
             last_depart=jnp.full(stops, NEVER, f),
             edges=nominal(self.network, f),
+            disruption=disruption.initial(stops, f),
             t=jnp.zeros((), jnp.int32),
             key=key,
         )
@@ -155,7 +157,9 @@ class BusEnv:
             noise = jnp.exp(mu + sigma * jax.random.normal(k_noise, (c.n_buses,), f))
         else:
             noise = jnp.ones(c.n_buses, f)
-        return Exogenous(arrivals, noise)
+        # A folded key, so the other draws are as they were before disruptions.
+        d = disruption.draw(c.disruption, jax.random.fold_in(key, 2), n, f)
+        return Exogenous(arrivals, noise, d.onset, d.duration)
 
     # -- dynamics ------------------------------------------------------------
 
@@ -252,6 +256,7 @@ class BusEnv:
         info = self._info()
         for b in range(c.n_buses):  # in bus order: lower buses board first
             state, info = self._bus(state, b, actions[b], noise[b], now, info)
+        state = self._advance_disruption(state, exo, now)
         state = state._replace(t=state.t + 1)
         waiting = state.waiting.sum()
         onboard = state.onboard.sum()
@@ -262,6 +267,20 @@ class BusEnv:
         truncated = state.t >= self.max_steps
         terminated = jnp.zeros((), bool)
         return state, TimeStep(self.observe(state), reward, terminated, truncated, info)
+
+    def _advance_disruption(self, state, exo, now):
+        """As sim.BusSim._advance_disruption: at the end of the tick."""
+        c = self.config.disruption
+        if c.mode == "none":
+            return state
+        n, f = self.config.n_stops, now.dtype
+        onset = jnp.ones(n, f) if exo.onset is None else jnp.asarray(exo.onset, f)
+        duration = jnp.zeros(n, f) if exo.duration is None else jnp.asarray(exo.duration, f)
+        draw = disruption.DisruptionDraw(onset, duration)
+        eligible = jnp.ones(n, bool)
+        d = disruption.step(c, state.disruption, draw, eligible, now, self.config.step_seconds)
+        is_open, speed = disruption.edge_effect(c, d)
+        return state._replace(disruption=d, edges=EdgeState(open=is_open, speed=speed))
 
     # -- observation ---------------------------------------------------------
 
@@ -301,11 +320,19 @@ class BusEnv:
         q = (ref[:, None] + jnp.arange(n)) % n  # (buses, stops)
         waiting = state.waiting.sum(axis=1)
         buses = jnp.arange(c.n_buses)[:, None]
+        d = state.disruption
+        down = d.down[q]
+        elapsed = jnp.where(down, jnp.minimum(d.elapsed[q] / h, 1.0), 0.0)
+        left = jnp.minimum(d.remaining[q] / h, 1.0)
+        left = jnp.where(down & c.disruption.observe_remaining, left, 0.0)
         stops = jnp.stack(
             [
                 jnp.minimum(waiting[q].astype(f) / cap, 1.0),
                 jnp.minimum(state.onboard[buses, q].astype(f) / cap, 1.0),
                 since[q],
+                down.astype(f),
+                elapsed,
+                left,
             ],
             axis=2,
         ).astype(jnp.float32)

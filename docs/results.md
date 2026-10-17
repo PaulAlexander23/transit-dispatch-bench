@@ -8,6 +8,9 @@ Baselines over 512 episodes each (seed 0). Score: random = 0, the env's heuristi
 | `bus/busy-v0` | random | -1563.2 ± 4.0 | 0.00 | mean wait 324 s, headway CV 0.81, bunching 0.139 |
 | `bus/busy-v0` | always go | -1436.5 ± 3.8 | 0.79 | mean wait 309 s, headway CV 0.90, bunching 0.211 |
 | `bus/busy-v0` | heuristic | -1403.3 ± 3.4 | 1.00 | mean wait 221 s, headway CV 0.47, bunching 0.000 |
+| `bus/closure-v0` | random | -1747.1 ± 5.5 | 0.00 | mean wait 428 s, headway CV 0.80, bunching 0.115 |
+| `bus/closure-v0` | always go | -1617.2 ± 6.1 | 0.85 | mean wait 368 s, headway CV 0.87, bunching 0.165 |
+| `bus/closure-v0` | heuristic | -1595.0 ± 6.9 | 1.00 | mean wait 323 s, headway CV 0.52, bunching 0.002 |
 | `bus/full-v0` | random | -1064.5 ± 1.8 | 0.00 | mean wait 258 s, headway CV 0.70, bunching 0.086 |
 | `bus/full-v0` | always go | -983.5 ± 1.7 | 1.00 | mean wait 226 s, headway CV 0.71, bunching 0.113 |
 | `bus/full-v0` | heuristic | -983.4 ± 1.7 | 1.00 | mean wait 180 s, headway CV 0.44, bunching 0.000 |

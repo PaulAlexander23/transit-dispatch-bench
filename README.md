@@ -13,7 +13,7 @@ heuristic, and a normalised score (random = 0, heuristic = 1).
 | `train/*` | Blocks of track, double or single | Go or wait (or terminate, or divert), per deciding train | Route setting, giving way to expresses, rerouting |
 
 Disruptions (blocked or slowed edges; Markov, semi-Markov or scripted) are a
-core process; `train/blockage-v0` switches them on, and `train/response-v0`
+core process; `bus/closure-v0` and `train/blockage-v0` switch them on, and `train/response-v0`
 adds a TERMINATE action (cancel or short-turn a train, at a cost per missed
 call). `train/junction-v0` adds route choice: relief tracks alongside two
 sections, and a DIVERT action to take them.

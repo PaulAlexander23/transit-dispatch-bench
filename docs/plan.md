@@ -501,8 +501,9 @@ optimal and copies section reservation, but does not yet improve on it.
       (reroute onto a relief track with DIVERT, Phase 3). The return half
       of a short-turn needs vehicle circulation (backlog).
 - [ ] Switch disruptions on for elevator (car out of service) and bus
-      (road closure, breakdown). The bus env already holds buses at a
-      closed edge; it is not yet wired to the process.
+      (road closure, breakdown). Bus road closures done (`bus/closure-v0`,
+      Result below). A car out of service and a bus breakdown are vehicle
+      failures, which the core process does not model yet (backlog).
 - [x] Evaluation: in-distribution, shift (trained without, tested with),
       and CVaR at 10% of delay alongside the mean.
 
@@ -622,6 +623,31 @@ them so far is a better rule, not RL.
     Starting from a clone keeps the rule's behaviour (the shield keeps
     GO/WAIT safe, so fine-tuning no longer erodes it), but 5M steps found
     no improvement.
+- **Bus road closures** (`BusConfig.disruption`, `bus/closure-v0`). The
+  bus env now runs the core process on its edges, as the train env does
+  on blocks: it advances at the end of each tick, a closed edge holds
+  buses at the stop before it, and a slowed one (speed > 1) stretches the
+  running time drawn on departure. The disruption draws use a key folded
+  from the step's key, so the arrival and noise draws of the other
+  presets are unchanged (their rows in the results table are identical).
+  Observation: per stop, the edge out of it is down, time since, and
+  time left if observable (`STOP_FIELDS` 3 → 6 on every bus preset).
+  JAX matches Python step for step on all presets. `closure` is `peak`
+  plus Markov closures, 0.1 per edge-hour, 5 minutes on average (about
+  one an episode). Harness, 512 episodes:
+
+  | Policy | `peak` return / wait / headway CV | `closure` |
+  |---|---|---|
+  | Always go | −1582 / 347 s / 0.83 | −1617 / 368 s / 0.87 |
+  | Headway holding | −1540 / 288 s / 0.46 | −1595 / 323 s / 0.52 |
+
+  A closure costs headway holding 55 return and 35 s of mean wait, and
+  its lead over always-go halves (42 → 22). A queue that forms behind a
+  closure leaves bunched; the rule re-spaces it at the next stops, but
+  only 120 s per stop (`max_hold_seconds`), and nothing in it
+  anticipates the closure (e.g. holding buses upstream while the road is
+  shut, so they do not all join the queue). That is headroom for a
+  closure-aware rule or a learner.
 ### Phase 5: on-demand fleet
 
 - [ ] Env: grid graph, requests with OD, vehicle assignment + repositioning.
@@ -689,6 +715,9 @@ designed for.
   rule that prices the queue behind a blocked train (trains waiting for
   it × expected time left); a value baseline for TERMINATE from rollouts
   (DLA, Powell's fourth class).
+- Vehicle failures in `core.disruption` (a vehicle stops for a random
+  time): a lift car out of service, a bus breakdown, a train failure.
+  A closure-aware bus rule (hold upstream buses while a road is shut).
 - Route choice: general alternative routes on a graph (relief tracks
   only cover a parallel track of equal length; a diversion via other
   stations, skipping calls, needs per-route tables); an exact AND-OR

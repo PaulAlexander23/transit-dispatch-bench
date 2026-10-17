@@ -9,6 +9,11 @@ Model (see docs/formulation.md, "Bus"):
   nominal time x edge speed factor x lognormal noise (mean 1, CV
   `travel_cv`), rounded up to whole ticks. A closed edge holds buses at the
   stop before it.
+- Road disruptions (`disruption`, see `core.disruption`): each edge can go
+  down at random, closed (speed 0) or slowed (speed > 1) for a random
+  time; the process moves on at the end of each tick, so the next
+  decisions see the state they act under. A bus already on an edge keeps
+  the running time it drew when it left.
 - Passengers arrive at each stop as a Poisson process (rate scaled over the
   episode by the demand profile), to a destination uniform over the other
   stops. Waiting passengers are counts per (stop, destination); boarding
@@ -39,6 +44,8 @@ from typing import NamedTuple
 
 import numpy as np
 
+from transit_bench.core import disruption
+from transit_bench.core.disruption import DisruptionConfig
 from transit_bench.core.network import loop
 
 GO, HOLD = 0, 1
@@ -47,7 +54,7 @@ DEMAND_PROFILES = ("flat", "peak")
 _PEAK_KEYFRAMES = ((0.0, 0.5), (0.5, 1.5), (1.0, 0.5))
 NEVER = -1e9  # last_depart before any bus has left a stop
 HEAD_FIELDS = 7  # per bus in the observation
-STOP_FIELDS = 3  # per stop offset in the observation
+STOP_FIELDS = 6  # per stop offset in the observation
 
 
 @dataclass(frozen=True)
@@ -66,6 +73,8 @@ class BusConfig:
     # defaults to an estimate of the loop time over the number of buses.
     target_headway: float | None = None
     max_hold_seconds: float = 120.0
+    # Edges going down at random (closed or slowed); none by default.
+    disruption: DisruptionConfig = DisruptionConfig()
 
     def __post_init__(self):
         if self.demand not in DEMAND_PROFILES:
@@ -101,6 +110,13 @@ PRESETS["peak"] = replace(PRESETS["busy"], demand="peak")
 # A longer route: twice the stops and buses, half the demand per stop, so
 # each bus carries about as many as on `peak` (up to ~60 of 80 at the peak).
 PRESETS["full"] = replace(PRESETS["peak"], n_stops=20, n_buses=6, arrival_rate=1 / 60)
+# Road closures on `peak`: about one an episode over the 10 edges (0.1 per
+# edge-hour), lasting 5 minutes on average (Markov: memoryless). Buses
+# queue at the stop before a closed edge and leave it bunched.
+PRESETS["closure"] = replace(
+    PRESETS["peak"],
+    disruption=DisruptionConfig(mode="markov", rate_per_hour=0.1, mean_seconds=300.0),
+)
 
 
 class Exogenous(NamedTuple):
@@ -108,6 +124,10 @@ class Exogenous(NamedTuple):
 
     arrivals: np.ndarray  # (stops, stops) int: new passengers per origin, destination
     noise: np.ndarray  # (buses,) float: running-time factor if the bus leaves this tick
+    # (edges,) disruption onset draws and outage seconds (core.disruption);
+    # None: no outage starts this tick.
+    onset: np.ndarray | None = None
+    duration: np.ndarray | None = None
 
 
 def demand_factor(demand, episode_fraction):
@@ -165,6 +185,9 @@ class BusSim:
         self.onboard = [[0] * c.n_stops for _ in range(c.n_buses)]
         self.waiting = [[0] * c.n_stops for _ in range(c.n_stops)]
         self.last_depart = [NEVER] * c.n_stops
+        self.edge_open = np.ones(c.n_stops, bool)
+        self.edge_speed = np.ones(c.n_stops)
+        self.disruption = disruption.initial_np(c.n_stops)
         return self.observe()
 
     def draw(self):
@@ -176,7 +199,8 @@ class BusSim:
             noise = self.rng.lognormal(mu, sigma, c.n_buses)
         else:
             noise = np.ones(c.n_buses)
-        return Exogenous(arrivals, noise)
+        d = disruption.draw_np(c.disruption, self.rng, c.n_stops)
+        return Exogenous(arrivals, noise, d.onset, d.duration)
 
     # -- dynamics ------------------------------------------------------------
 
@@ -246,6 +270,7 @@ class BusSim:
                 self.waiting[s][d] -= take
                 self.onboard[b][d] += take
                 n_board -= take
+        self._advance_disruption(exo, now)
         self.t += 1
         waiting = sum(map(sum, self.waiting))
         onboard = sum(map(sum, self.onboard))
@@ -253,6 +278,19 @@ class BusSim:
         info["onboard"] = onboard
         reward = -(waiting + onboard) * c.step_seconds / 60 / c.n_stops
         return self.observe(), reward, self.t >= self.max_steps, info
+
+    def _advance_disruption(self, exo, now):
+        c = self.config.disruption
+        if c.mode == "none":
+            return
+        n = self.config.n_stops
+        onset = np.ones(n) if exo.onset is None else exo.onset
+        duration = np.zeros(n) if exo.duration is None else exo.duration
+        draw = disruption.DisruptionDraw(onset, duration)
+        eligible = np.ones(n, bool)
+        dt = self.config.step_seconds
+        self.disruption = disruption.step_np(c, self.disruption, draw, eligible, now, dt)
+        self.edge_open, self.edge_speed = disruption.edge_effect_np(c, self.disruption)
 
     # -- observation ---------------------------------------------------------
 
@@ -271,8 +309,11 @@ class BusSim:
         headways, capped at 2, halved), time held (in headways, capped at 1),
         progress along the current edge. Then for each stop from that one on
         round the loop: people waiting there and on board for there (over the
-        capacity, capped at 1), and time since a bus last left it (in
-        headways, capped at 2, halved; 1 if none has).
+        capacity, capped at 1), time since a bus last left it (in
+        headways, capped at 2, halved; 1 if none has), and the edge out of
+        it: down, time since it went down and time until it comes back (in
+        headways, capped at 1; the last is 0 unless the disruption config
+        makes it observable).
         """
         c = self.config
         h, cap = c.headway, c.capacity
@@ -282,6 +323,15 @@ class BusSim:
             1.0 if last <= NEVER else min((now - last) / h, 2.0) / 2 for last in self.last_depart
         ]
         waiting = [sum(row) for row in self.waiting]
+        d, dc = self.disruption, c.disruption
+        outage = [
+            [
+                float(d.down[q]),
+                min(d.elapsed[q] / h, 1.0) if d.down[q] else 0.0,
+                min(d.remaining[q] / h, 1.0) if d.down[q] and dc.observe_remaining else 0.0,
+            ]
+            for q in range(c.n_stops)
+        ]
         blocks = []
         for b in range(c.n_buses):
             others = [positions[o] for o in range(c.n_buses) if o != b]
@@ -302,6 +352,7 @@ class BusSim:
             for k in range(c.n_stops):
                 q = (ref + k) % c.n_stops
                 stops += [min(waiting[q] / cap, 1.0), min(self.onboard[b][q] / cap, 1.0), since[q]]
+                stops += outage[q]
             blocks.append(head + stops)
         return np.array(blocks, dtype=np.float32).ravel()
 
