@@ -101,6 +101,9 @@ class Infra(NamedTuple):
     # (trains, L + 1): at route index pos + 1, the next section the train
     # will enter from outside it (-1 if none left).
     next_section: np.ndarray
+    # (trains, L + 1): at route index q, the first platform after q (-1 if none):
+    # where a train entering a section at q will next stop.
+    far_platform: np.ndarray
 
 
 def build(config: TrainConfig) -> Infra:
@@ -182,6 +185,13 @@ def build(config: TrainConfig) -> Infra:
                 if sec >= 0 and sec != here:
                     next_section[i, pos + 1] = sec
                     break
+    far_platform = np.full((T, L + 1), -1, np.int64)
+    for i in range(T):
+        for q in range(L):
+            for p in range(q + 1, L):
+                if station_of[route[i, p]] >= 0:
+                    far_platform[i, q] = route[i, p]
+                    break
     return Infra(
         n_blocks,
         station_of,
@@ -194,4 +204,5 @@ def build(config: TrainConfig) -> Infra:
         direction,
         express,
         next_section,
+        far_platform,
     )

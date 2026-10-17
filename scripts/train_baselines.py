@@ -1,7 +1,7 @@
 """Train env baselines and short MAPPO runs, with domain metrics.
 
-For each preset: random, first come first served and section reservation
-over many episodes (return = minus total delay in minutes, mean arrival
+For each preset: random, first come first served, section reservation and
+route setting over many episodes (return = minus total delay in minutes, mean arrival
 delay per train, deadlock rate, trains finished), then optionally MAPPO
 for a few million steps, from scratch or after imitating the heuristic.
 
@@ -18,7 +18,7 @@ from transit_bench.algos.imitate import warm_start
 from transit_bench.algos.ppo import PPOConfig, policy, train
 from transit_bench.core.policy import RandomPolicy, make_rollout
 from transit_bench.core.vec import make_vec_env
-from transit_bench.envs.train.heuristic import FirstComeFirstServed
+from transit_bench.envs.train.heuristic import FirstComeFirstServed, SectionReservation
 
 
 def metrics(env, rewards, info):
@@ -82,7 +82,8 @@ def main():
         for name, pol in [
             ("random", RandomPolicy(env)),
             ("fcfs", FirstComeFirstServed(env)),
-            ("reservation", env.heuristic()),
+            ("reservation", SectionReservation(env)),
+            ("route setting", env.heuristic()),
         ]:
             rollout = jax.jit(make_rollout(env, pol, args.episodes, env.max_steps))
             show(name, metrics(env, *rollout(jax.random.key(1))))

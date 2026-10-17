@@ -10,7 +10,7 @@ import pytest
 from transit_bench import make
 from transit_bench.core.policy import RandomPolicy, make_rollout
 from transit_bench.envs.train import PRESETS, TrainConfig, TrainEnv
-from transit_bench.envs.train.heuristic import FirstComeFirstServed
+from transit_bench.envs.train.heuristic import FirstComeFirstServed, SectionReservation
 from transit_bench.envs.train.infra import EAST, WEST, build
 from transit_bench.envs.train.sim import (
     GO,
@@ -18,6 +18,7 @@ from transit_bench.envs.train.sim import (
     Exogenous,
     TrainSim,
     first_come_first_served,
+    route_setting,
     section_reservation,
 )
 
@@ -213,6 +214,7 @@ def test_jax_matches_python_step_for_step(preset):
         replay(preset, lambda sim, rng: rng.integers(2, size=len(sim.pos)), seed)
         replay(preset, lambda sim, rng: first_come_first_served(sim), seed)
         replay(preset, lambda sim, rng: section_reservation(sim), seed)
+        replay(preset, lambda sim, rng: route_setting(sim), seed)
 
 
 @pytest.mark.usefixtures("x64")
@@ -220,7 +222,8 @@ def test_jax_matches_python_step_for_step(preset):
 def test_jax_heuristics_match_python(preset):
     env = TrainEnv(preset)
     for policy, reference in [
-        (env.heuristic(), section_reservation),
+        (env.heuristic(), route_setting),
+        (SectionReservation(env), section_reservation),
         (FirstComeFirstServed(env), first_come_first_served),
     ]:
         sim = TrainSim(preset)
@@ -322,3 +325,27 @@ def test_observation_shows_an_oncoming_rival_for_the_section():
     assert list(inside) == [0, 0]
     assert list(before) == [0, 1]  # train 1 sees train 0 go first
     assert list(after) == [1, 0]
+
+
+def test_route_setting_avoids_the_platform_cycle_deadlocks():
+    """Over 100 seeds on `single`, section reservation deadlocks a few
+    times; route setting never does, and is not later on average."""
+
+    def run(policy):
+        deadlocks, total = 0, 0.0
+        for seed in range(100):
+            sim = TrainSim("single")
+            sim.reset(seed)
+            done, stuck = False, 0
+            while not done:
+                _, reward, terminated, truncated, info = sim.step(policy(sim))
+                total += reward
+                stuck = max(stuck, info["deadlocked"])
+                done = terminated or truncated
+            deadlocks += stuck > 0
+        return deadlocks, total
+
+    reserve_dl, reserve_return = run(section_reservation)
+    route_dl, route_return = run(route_setting)
+    assert reserve_dl > 0 and route_dl == 0
+    assert route_return > reserve_return

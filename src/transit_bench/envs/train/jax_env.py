@@ -78,10 +78,10 @@ class TrainEnv:
         self.n_squarings = max(1, math.ceil(math.log2(T)))
 
     def heuristic(self):
-        """Section reservation, the stronger of the two rules."""
-        from transit_bench.envs.train.heuristic import SectionReservation
+        """Route setting, the strongest of the rules (`heuristic`)."""
+        from transit_bench.envs.train.heuristic import RouteSetting
 
-        return SectionReservation(self)
+        return RouteSetting(self)
 
     # -- state ---------------------------------------------------------------
 

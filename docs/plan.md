@@ -340,16 +340,74 @@ optimal and copies section reservation, but does not yet improve on it.
     help, and it needs look-ahead along the route behind the train.
 ### Phase 4: disruptions
 
-- [ ] Core disruption process: edge outages (`κ_e = 0`), slow running
+- [x] Core disruption process: edge outages (`κ_e = 0`), slow running
       (`σ_e > 1`), vehicle failures, demand surges. Markov, semi-Markov
       (lognormal durations, elapsed time observed) and scripted modes.
-- [ ] Observation switch: remaining outage time visible or hidden.
+      Done for edge outages and slow running (`core/disruption.py`);
+      vehicle failures and demand surges are still to do.
+- [x] Observation switch: remaining outage time visible or hidden.
 - [ ] Train `blockage` preset with short-turn, cancel and reroute actions.
+      The preset exists (random closures on the single-track line); the
+      response actions are still to do.
 - [ ] Switch disruptions on for elevator (car out of service) and bus
-      (road closure, breakdown).
-- [ ] Evaluation: in-distribution, shift (trained without, tested with),
+      (road closure, breakdown). The bus env already holds buses at a
+      closed edge; it is not yet wired to the process.
+- [x] Evaluation: in-distribution, shift (trained without, tested with),
       and CVaR at 10% of delay alongside the mean.
 
+**Result.** Disruptions work end to end on the train env; the best answer to
+them so far is a better rule, not RL.
+
+- **Process** (`core/disruption.py`). Each eligible edge is up or down;
+  both random modes draw the outage's full duration at onset and count it
+  down. For exponential durations this is the same process as a per-tick
+  repair chance (memoryless), so one mechanism serves Markov and
+  semi-Markov. Tested: outage rate, mean and CV of durations, and the
+  stationary fraction down `λm/(1+λm)`. NumPy and JAX agree exactly given
+  the same draws. The train env advances it at the *end* of each tick (so
+  the policy sees the state it will act under), over section blocks only.
+  It observes per look-ahead block how long the block has been down, and
+  how long it has left only when `observe_remaining` is set.
+- **`train/blockage-v0`**: `single` plus Markov closures (0.1 per section
+  block per hour, mean 10 min: about 0.8 outages an episode).
+- **A third rule, route setting, found by reading the deadlocks.** The
+  deadlocks section reservation still allowed are four-train cycles
+  through two sections and the two platforms of one station (described in
+  `sim.route_setting`). Entering a section only when the platform at its
+  far end is free, i.e. station-to-station route setting as real
+  interlockings do, removes them on this line. It is now the train env's
+  heuristic (`TrainEnv.heuristic()`).
+- **Results** (`scripts/disruption_eval.py`, 1,024 episodes; delay per
+  train in minutes, mean of the worst 10% of episodes, deadlock rate):
+
+  | Policy | `single` | `blockage` |
+  |---|---|---|
+  | First come, first served | 5.24 / 30.5 / 0.23 | 9.01 / 34.6 / 0.39 |
+  | Section reservation | 1.42 / 7.25 / 0.021 | 4.05 / 25.0 / 0.099 |
+  | **Route setting** | **1.15 / 4.36 / 0** | **3.05 / 15.7 / 0.003** |
+  | Clone of route setting, trained on `single` | 1.15 / 4.36 / 0 | 3.05 / 15.7 / 0.003 |
+  | That clone + MAPPO 5M on `blockage` | 1.59 / 8.89 / 0.030 | 4.17 / 25.5 / 0.105 |
+
+- **What was learned.**
+  - Blockages roughly triple delay and quadruple the tail (CVaR 4.4 →
+    15.7 min under route setting), and blocked trains bunch, which makes
+    deadlock cycles more likely. The tail metric moves far more than the
+    mean, which is why it belongs in the benchmark.
+  - Shift: a clone that copies a rule exactly transfers exactly, because
+    the rule never looked at the disruption fields. A learned policy that
+    used them could not be tested this way; that needs a policy that
+    beats the rules first.
+  - **PPO fine-tuning destroys the deadlock avoidance it starts with**
+    (deadlocks 0 → 3% on `single`, 0.3% → 10.5% on `blockage`, after 5M
+    steps at lr 5e-5). The penalty for a deadlock arrives long after the
+    decision that caused it, so the policy gradient does not protect the
+    rare WAIT decisions that prevent it, and noise erodes them. Candidates:
+    a deadlock penalty (named shaping), longer rollouts and higher γ, a
+    KL penalty to the clone, or action masking that forbids unsafe GO
+    (a safety shield, as in the 2026 shielding paper in related work).
+  - With only go/wait, a dispatcher has few levers once a block is closed.
+    The disruption *response* actions (short-turn, cancel, reroute) are
+    where a learner could add value over the rules.
 ### Phase 5: on-demand fleet
 
 - [ ] Env: grid graph, requests with OD, vehicle assignment + repositioning.
@@ -379,6 +437,9 @@ optimal and copies section reservation, but does not yet improve on it.
   overtaking on `passing`; passengers and connections; longer PPO runs and
   longer rollouts for deadlock credit; a deadlock penalty or early
   termination as a named shaping.
+- Safe RL for rail: mask GO actions that a deadlock check (route setting,
+  or a look-ahead on the wait-for graph) rules out, so exploration cannot
+  cause deadlocks; compare with a deadlock-penalty shaping.
 - Adversarial disruptions: a second agent picks which edge to block
   (attacker–defender), for a worst-case robustness score.
 - RL proposes, a solver repairs: RL picks train orderings and a replanner
