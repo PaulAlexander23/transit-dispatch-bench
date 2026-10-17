@@ -2,8 +2,14 @@
 
 `CollectivePolicy` is the Python reference (ported from elevator-dispatching-rl's
 `baselines.py`), reading the "custom" observation through the Stable-Baselines3
-`predict` interface.
+`predict` interface. `CollectiveControl` is the same policy in JAX, reading
+the env state, so it runs inside `jit` over thousands of envs (for the
+benchmark harness and for collecting imitation data).
 """
+
+import jax.numpy as jnp
+
+from transit_bench.envs.elevator.sim import DOWN, IDLE, MOVING, SERVE, SERVE_DOWN, SERVE_UP, UP
 
 
 class CollectivePolicy:
@@ -101,3 +107,81 @@ class CollectivePolicy:
             return serve(d) if stop_at(floor, d) else go(d)
         self.directions[i] = -1
         return DOWN  # park at the lobby
+
+
+class CollectiveControl:
+    """`CollectivePolicy` in JAX, for the "step" action mode.
+
+    A `core.types.Policy`: `init()` gives the carry (each lift's sweep
+    direction) and `act(carry, state, key)` the next carry and one action per
+    lift. Lifts decide independently from the same state, so the per-lift
+    loop of the Python version becomes array operations over lifts and floors.
+    """
+
+    def __init__(self, env):
+        if env.action_mode != "step":
+            raise ValueError("collective control acts in the 'step' action mode")
+        self.env = env
+
+    def init(self):
+        return jnp.ones(self.env.config.n_lifts, jnp.int32)
+
+    def act(self, directions, state, key=None):
+        env = self.env
+        c = env.config
+        n = c.n_floors
+        floor = env._floor(state.position)  # (lifts,)
+        want = state.passengers > 0  # (lifts, floors)
+        if c.hall_calls:
+            up = state.queue_up > 0
+            down = (state.queue_len - state.queue_up) > 0
+        else:
+            up = down = state.queue_len > 0
+        room = state.passengers.sum(axis=1) < c.lift_capacity  # (lifts,)
+        work = want | up | down  # (lifts, floors)
+        floors = jnp.arange(n)
+        lifts = jnp.arange(c.n_lifts)
+
+        def stop_at(f, d):
+            calls = jnp.where((d > 0) | (not c.hall_calls), up[f], down[f])
+            return want[lifts, f] | (room & calls)
+
+        def work_beyond(f, d):
+            ahead = jnp.where(d[:, None] > 0, floors > f[:, None], floors < f[:, None])
+            return (work & ahead).any(axis=1)
+
+        def serve(d):
+            if not c.hall_calls:
+                return jnp.full_like(d, SERVE)
+            return jnp.where(d > 0, SERVE_UP, SERVE_DOWN)
+
+        def go(d):
+            return jnp.where(d > 0, UP, DOWN)
+
+        d = directions
+        turn = stop_at(floor, -d) | work_beyond(floor, -d)
+        turned = -d
+        idle_action = jnp.where(
+            stop_at(floor, d),
+            serve(d),
+            jnp.where(
+                work_beyond(floor, d),
+                go(d),
+                jnp.where(
+                    turn,
+                    jnp.where(stop_at(floor, turned), serve(turned), go(turned)),
+                    DOWN,  # park at the lobby
+                ),
+            ),
+        )
+        new_d = jnp.where(stop_at(floor, d) | work_beyond(floor, d), d, jnp.where(turn, turned, -1))
+        if not c.kinematics:
+            return new_d, idle_action
+        # A busy lift carries on past its target only if there is no reason
+        # to stop there; otherwise it asks to serve, which is ignored while busy.
+        status = env.status(state)
+        target = state.target
+        carry_on = (status == MOVING) & ~stop_at(target, d) & work_beyond(target, d)
+        busy_action = jnp.where(carry_on, go(d), serve(d))
+        busy = status != IDLE
+        return jnp.where(busy, d, new_d), jnp.where(busy, busy_action, idle_action)
