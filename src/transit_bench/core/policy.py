@@ -36,7 +36,10 @@ def make_rollout(env, policy, n_envs, n_steps):
     """rollout(key) -> per-step (reward, info) of `n_envs` envs under `policy`.
 
     Runs inside one `jit`: (n_steps, n_envs) rewards and info arrays.
-    `n_steps` is usually env.max_steps, for one episode per env.
+    `n_steps` is usually env.max_steps, for one episode per env. Only each
+    env's first episode counts: rewards and info after it ends (an env that
+    terminates early resets and carries on) are zeroed, so sums over the
+    steps are per-episode totals.
     """
     from transit_bench.core.vec import make_vec_env
 
@@ -49,7 +52,7 @@ def make_rollout(env, policy, n_envs, n_steps):
         carry = jax.vmap(lambda _: policy.init())(jnp.arange(n_envs))
 
         def body(loop, key):
-            vec_state, carry = loop
+            vec_state, carry, alive = loop
             carry, action = act(carry, vec_state.env, jax.random.split(key, n_envs))
             vec_state, ts = step(vec_state, action)
             # A finished env starts afresh, and so does its policy's memory.
@@ -59,9 +62,17 @@ def make_rollout(env, policy, n_envs, n_steps):
                 return jnp.where(ts.done.reshape((-1,) + (1,) * (old.ndim - 1)), new, old)
 
             carry = jax.tree.map(pick, fresh, carry)
-            return (vec_state, carry), (ts.reward, ts.info)
 
-        _, out = jax.lax.scan(body, (vec_state, carry), jax.random.split(k_run, n_steps))
+            def mask(x):
+                return jnp.where(alive.reshape((-1,) + (1,) * (x.ndim - 1)), x, 0).astype(x.dtype)
+
+            info = jax.tree.map(mask, ts.info)
+            reward = jnp.where(alive, ts.reward, 0.0)
+            return (vec_state, carry, alive & ~ts.done), (reward, info)
+
+        alive = jnp.ones(n_envs, bool)
+        keys = jax.random.split(k_run, n_steps)
+        _, out = jax.lax.scan(body, (vec_state, carry, alive), keys)
         return out
 
     return rollout
