@@ -387,6 +387,7 @@ them so far is a better rule, not RL.
   | **Route setting** | **1.15 / 4.36 / 0** | **3.05 / 15.7 / 0.003** |
   | Clone of route setting, trained on `single` | 1.15 / 4.36 / 0 | 3.05 / 15.7 / 0.003 |
   | That clone + MAPPO 5M on `blockage` | 1.59 / 8.89 / 0.030 | 4.17 / 25.5 / 0.105 |
+  | MAPPO 5M from scratch under the shield | 1.15 / 4.36 / 0 | 3.05 / 15.7 / 0.003 |
 
 - **What was learned.**
   - Blockages roughly triple delay and quadruple the tail (CVaR 4.4 →
@@ -405,6 +406,15 @@ them so far is a better rule, not RL.
     a deadlock penalty (named shaping), longer rollouts and higher γ, a
     KL penalty to the clone, or action masking that forbids unsafe GO
     (a safety shield, as in the 2026 shielding paper in related work).
+  - **Tried the shield** (`TrainEnv(shield=True)`: any GO route setting
+    forbids becomes WAIT, and a vetoed train is not an active agent).
+    Under it, always-GO *is* route setting (tested), so the shield makes
+    the rule the floor. MAPPO from scratch under the shield converges to
+    exactly that floor in 5M steps (identical numbers to route setting):
+    safe, but it found no extra holds that pay. Improving on the rule
+    needs either decisions the rule does not make (the response actions
+    below) or a signal for the holds that do pay (e.g. holding a train at
+    a crossing loop for a late oncoming one).
   - With only go/wait, a dispatcher has few levers once a block is closed.
     The disruption *response* actions (short-turn, cancel, reroute) are
     where a learner could add value over the rules.
