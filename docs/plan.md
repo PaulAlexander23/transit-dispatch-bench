@@ -500,10 +500,9 @@ optimal and copies section reservation, but does not yet improve on it.
       before departure or short-turns it at a platform), and `junction`
       (reroute onto a relief track with DIVERT, Phase 3). The return half
       of a short-turn needs vehicle circulation (backlog).
-- [ ] Switch disruptions on for elevator (car out of service) and bus
-      (road closure, breakdown). Bus road closures and breakdowns done
-      (`bus/closure-v0`, `bus/breakdown-v0`, Result below). The elevator
-      (a car out of service) is still to do.
+- [x] Switch disruptions on for elevator (car out of service) and bus
+      (road closure, breakdown). Done: `bus/closure-v0`,
+      `bus/breakdown-v0` and `elevator/outage-v0` (Result below).
 - [x] Evaluation: in-distribution, shift (trained without, tested with),
       and CVaR at 10% of delay alongside the mean.
 
@@ -663,6 +662,21 @@ them so far is a better rule, not RL.
   removes a third of the capacity, and no holding rule recovers that.
   The levers that would are out of this env's action space (a spare bus,
   short-turning the bus behind).
+- **Lift cars out of service** (`ElevatorConfig.failure`,
+  `elevator/outage-v0`). The same vehicle-failure use of the process: an
+  out-of-service car ignores its actions, finishes any move or door cycle
+  under way, and stands with its passengers until it is back. The
+  observation gains one entry per lift (out of service) *only* when the
+  config has failures, and the failure draws use a key folded from the
+  step's, so the other presets' observations and draws are unchanged and
+  the port still matches the old repo exactly. JAX matches Python step
+  for step, including a test where every car fails and recovers within
+  80 steps. `outage` is `full` with 3 failures per car-hour lasting a
+  minute on average (about 0.7 in a 200 s episode across 4 cars).
+  Collective control delivers 65.8 vs 67.1 on `full` (512 episodes): it
+  does not coordinate the cars, so nothing is assigned to a dead car and
+  the other three pick up its calls. Small at this rate; longer episodes
+  or rarer, longer outages would weigh more.
 ### Phase 5: on-demand fleet
 
 - [ ] Env: grid graph, requests with OD, vehicle assignment + repositioning.
@@ -730,8 +744,8 @@ designed for.
   rule that prices the queue behind a blocked train (trains waiting for
   it × expected time left); a value baseline for TERMINATE from rollouts
   (DLA, Powell's fourth class).
-- Vehicle failures for the lift (a car out of service) and the train (a
-  train failure), as done for buses. A closure-aware bus rule (hold
+- Train failures (a train stops in its block for a random time), as done
+  for buses and lifts; demand surges in the core process. A closure-aware bus rule (hold
   upstream buses while a road is shut). Bus response actions for
   breakdowns: a spare bus, or short-turning the bus behind.
 - Route choice: general alternative routes on a graph (relief tracks

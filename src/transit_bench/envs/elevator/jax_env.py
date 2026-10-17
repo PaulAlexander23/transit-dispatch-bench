@@ -46,7 +46,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from transit_bench.core import demand
+from transit_bench.core import demand, disruption
 from transit_bench.core.obs import one_hot  # noqa: F401 (re-exported)
 from transit_bench.core.types import TimeStep
 from transit_bench.envs.elevator.gym_env import (
@@ -94,6 +94,7 @@ class EnvState(NamedTuple):
     steps: jax.Array  # () int
     last_potential: jax.Array  # () float
     dropped: jax.Array  # () int: arrivals lost to full queues or the per-step cap
+    failure: disruption.DisruptionState  # per lift: out of service, elapsed, remaining
     key: jax.Array  # PRNG key for this env's arrivals
 
 
@@ -186,17 +187,25 @@ class ElevatorEnv:
         self._origins = origins
         self._destinations = destinations
         self.arrival_slots = arrival_slots(c)
+        self.has_failure = c.failure.mode != "none"
         if obs_type == "relative":
+            head = RELATIVE_LIFT_FIELDS + (1 if self.has_failure else 0)
             self.observation_size = c.n_lifts * (
-                RELATIVE_LIFT_FIELDS + (2 * c.n_floors - 1) * RELATIVE_FLOOR_FIELDS
+                head + (2 * c.n_floors - 1) * RELATIVE_FLOOR_FIELDS
             )
         else:
             lift_fields = 4 if c.kinematics else 2
             n_waiting = (2 if c.hall_calls else 1) * c.n_floors
             n_free = c.n_lifts if action_mode == "target" else 0
             n_dir = c.n_lifts if observe_direction else 0
+            n_down = c.n_lifts if self.has_failure else 0
             self.observation_size = (
-                c.n_lifts * lift_fields + n_waiting + c.n_lifts * c.n_floors + n_free + n_dir
+                c.n_lifts * lift_fields
+                + n_waiting
+                + c.n_lifts * c.n_floors
+                + n_free
+                + n_dir
+                + n_down
             )
             # Choices per entry, as ElevatorGymEnv's MultiDiscrete observation_space.nvec.
             per_lift = [c.n_floors, c.lift_capacity + 1]
@@ -207,7 +216,9 @@ class ElevatorEnv:
             if n_free:
                 nvec[len(nvec) - n_dir - n_free : len(nvec) - n_dir] = 2
             if n_dir:
-                nvec[-n_dir:] = 3
+                nvec[len(nvec) - n_down - n_dir : len(nvec) - n_down] = 3
+            if n_down:
+                nvec[-n_down:] = 2
             self.observation_nvec = nvec
 
     # -- state ---------------------------------------------------------------
@@ -234,6 +245,7 @@ class ElevatorEnv:
             steps=jnp.zeros((), jnp.int32),
             last_potential=jnp.zeros((), f),
             dropped=jnp.zeros((), jnp.int32),
+            failure=disruption.initial(lifts, f),
             key=key,
         )
 
@@ -458,8 +470,9 @@ class ElevatorEnv:
         delivered, boarded, served = [], [], []
         for i in range(c.n_lifts):  # in lift order: lower lifts board first
             action = actions[i]
-            is_move = (action == UP) | (action == DOWN)
-            can_serve = ~is_move
+            up = ~state.failure.down[i]  # an out-of-service car ignores its action
+            is_move = ((action == UP) | (action == DOWN)) & up
+            can_serve = ~((action == UP) | (action == DOWN)) & up
             if c.kinematics:
                 can_serve &= self.status(state)[i] == IDLE
             state = self._move(state, i, jnp.where(action == UP, 1, -1), is_move)
@@ -520,12 +533,16 @@ class ElevatorEnv:
         remaining = (state.passengers * jnp.abs(floors - state.position[:, None])).sum()
         return -shaping.progress * remaining / (self.config.n_floors - 1)
 
-    def step(self, state, actions, arrivals=None):
+    def step(self, state, actions, arrivals=None, failure=None):
         """One step: (state, TimeStep). No auto-reset (see `core.vec`).
 
-        `arrivals` replaces this step's draw, to replay a Python trajectory.
+        `arrivals` and `failure` (a `core.disruption.DisruptionDraw`) replace
+        this step's draws, to replay a Python trajectory.
         """
         c = self.config
+        if failure is None and self.has_failure:
+            # A folded key, so the arrival draws are as without failures.
+            failure = disruption.draw(c.failure, jax.random.fold_in(state.key, 3), c.n_lifts)
         if arrivals is None:
             key, sub = jax.random.split(state.key)
             state = state._replace(key=key)
@@ -559,6 +576,15 @@ class ElevatorEnv:
             if shaping.waiting:
                 reward -= shaping.waiting * state.queue_len.sum() / c.n_floors
 
+        if self.has_failure:
+            f_ = state.position.dtype
+            now = (state.steps * c.step_seconds).astype(f_)
+            draw = disruption.DisruptionDraw(
+                jnp.asarray(failure.onset, f_), jnp.asarray(failure.duration, f_)
+            )
+            eligible = jnp.ones(c.n_lifts, bool)
+            new = disruption.step(c.failure, state.failure, draw, eligible, now, c.step_seconds)
+            state = state._replace(failure=new)
         state = state._replace(steps=state.steps + 1)
         truncated = state.steps >= self.max_steps
         info = {
@@ -599,6 +625,8 @@ class ElevatorEnv:
         ]
         if self.observe_direction:
             parts.append(jnp.where(state.direction < 0, 2, state.direction))  # 0, up 1, down 2
+        if self.has_failure:
+            parts.append(state.failure.down.astype(jnp.int32))
         return jnp.concatenate(parts).astype(jnp.float32)
 
     def _relative(self, state):
@@ -626,6 +654,7 @@ class ElevatorEnv:
                 state.velocity / self._max_speed,
                 door,
                 (~state.has_goal).astype(f) if self.action_mode == "target" else jnp.ones(lifts, f),
+                *([state.failure.down.astype(f)] if self.has_failure else []),
             ],
             axis=1,
         ).astype(jnp.float32)

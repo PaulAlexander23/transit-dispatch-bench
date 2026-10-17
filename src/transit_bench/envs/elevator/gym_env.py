@@ -148,6 +148,9 @@ class ElevatorGymEnv(Env):
             self.action_space = spaces.MultiDiscrete([c.n_actions] * c.n_lifts)
         n_free = c.n_lifts if action_mode == "target" else 0
         n_dir = c.n_lifts if observe_direction else 0
+        # With car failures, one more entry per lift: out of service.
+        self.has_failure = c.failure.mode != "none"
+        n_down = c.n_lifts if self.has_failure else 0
         lift_fields = 4 if c.kinematics else 2
         n_waiting = (2 if c.hall_calls else 1) * c.n_floors
         if obs_type == "custom":
@@ -155,17 +158,25 @@ class ElevatorGymEnv(Env):
             if c.kinematics:
                 per_lift += [c.n_floors, 3]
             nvec = np.full(
-                c.n_lifts * lift_fields + n_waiting + c.n_lifts * c.n_floors + n_free + n_dir,
+                c.n_lifts * lift_fields
+                + n_waiting
+                + c.n_lifts * c.n_floors
+                + n_free
+                + n_dir
+                + n_down,
                 c.lift_capacity + 1,
             )
             nvec[: c.n_lifts * lift_fields] = np.tile(per_lift, c.n_lifts)
             if n_free:
                 nvec[len(nvec) - n_dir - n_free : len(nvec) - n_dir] = 2
             if n_dir:
-                nvec[-n_dir:] = 3
+                nvec[len(nvec) - n_down - n_dir : len(nvec) - n_down] = 3
+            if n_down:
+                nvec[-n_down:] = 2
             self.observation_space = spaces.MultiDiscrete(nvec)
         else:
-            size = c.n_lifts * (RELATIVE_LIFT_FIELDS + (2 * c.n_floors - 1) * RELATIVE_FLOOR_FIELDS)
+            head = RELATIVE_LIFT_FIELDS + (1 if self.has_failure else 0)
+            size = c.n_lifts * (head + (2 * c.n_floors - 1) * RELATIVE_FLOOR_FIELDS)
             self.observation_space = spaces.Box(-1, 1, shape=(size,), dtype=np.float32)
 
     def reset(self, seed=None, options=None):
@@ -234,6 +245,9 @@ class ElevatorGymEnv(Env):
         for i, (lift, position) in enumerate(zip(self.sim.state().lifts, before, strict=True)):
             if lift.position != position:
                 self._directions[i] = 1 if lift.position > position else -1
+        if self.has_failure:
+            now = self.steps * self.config.step_seconds
+            self.sim.advance_failure(self.sim.draw_failure(), now)
 
         reward = float(sum(delivered))
         shaping = self.reward_shaping
@@ -291,6 +305,8 @@ class ElevatorGymEnv(Env):
         obs += [min(w, c.lift_capacity) for w in waiting] + wanted + self._free()
         if self.observe_direction:
             obs += [{0: 0, 1: 1, -1: 2}[d] for d in self._directions]
+        if self.has_failure:
+            obs += [int(self.sim.out_of_service(i)) for i in range(c.n_lifts)]
         return np.array(obs, dtype=np.int64)
 
     def _relative_observation(self, waiting, wanted):
@@ -321,6 +337,8 @@ class ElevatorGymEnv(Env):
                 lift.door_timer / c.door_time if c.kinematics else 0.0,
                 free[i],
             ]
+            if self.has_failure:
+                head.append(float(self.sim.out_of_service(i)))
             # Floor arrays padded by n - 1 on each side, then a window centred
             # on this lift: index n - 1 of the window is the lift's own floor.
             grid = np.zeros((3 * n - 2, RELATIVE_FLOOR_FIELDS), dtype=np.float32)

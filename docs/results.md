@@ -36,6 +36,8 @@ Baselines over 512 episodes each (seed 0). Score: random = 0, the env's heuristi
 | `elevator/multi-v0` | heuristic | 216.0 ± 0.3 | 1.00 | delivered/ep 216.0 |
 | `elevator/original-v0` | random | 18.6 ± 0.3 | 0.00 | delivered/ep 18.6 |
 | `elevator/original-v0` | heuristic | 136.4 ± 0.3 | 1.00 | delivered/ep 136.4 |
+| `elevator/outage-v0` | random | 5.9 ± 0.1 | 0.00 | delivered/ep 5.9 |
+| `elevator/outage-v0` | heuristic | 65.8 ± 0.2 | 1.00 | delivered/ep 65.8 |
 | `elevator/tall-v0` | random | 4.0 ± 0.1 | 0.00 | delivered/ep 4.0 |
 | `elevator/tall-v0` | heuristic | 58.3 ± 0.2 | 1.00 | delivered/ep 58.3 |
 | `train/blockage-v0` | random | -105.0 ± 4.1 | 0.00 | delay/train 13.13 min, CVaR10 35.80 min, deadlocks 0.525 |
