@@ -17,3 +17,9 @@ def test_harness_scores_random_zero_and_heuristic_one(tmp_path):
     benchmark.write(path, table)
     text = path.read_text()
     assert text.startswith("intro") and text.endswith("outtro\n") and "old" not in text
+
+
+def test_harness_adds_a_trained_row():
+    rows = benchmark.run(["fleet/grid-v0"], n_episodes=2, ppo_timesteps=8192)
+    names = [name for _, name, *_ in rows]
+    assert "mappo 8,192" in names

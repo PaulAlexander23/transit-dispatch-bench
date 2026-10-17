@@ -745,9 +745,14 @@ rules, the strongest a third better than nearest idle.
 - [x] One command runs random, heuristic and PPO on every env/preset over
       seeds and writes a results table (normalised scores + domain metrics),
       like the old repo's `benchmark.py --readme`. Done for the baselines:
-      `python -m transit_bench.benchmark --write docs/results.md`; PPO rows
-      come from the per-env scripts for now (`reproduce_elevator.py`,
-      `bus_baselines.py`, `train_baselines.py`, `disruption_eval.py`).
+      `python -m transit_bench.benchmark --write docs/results.md`. PPO
+      rows: `--ppo-timesteps N` trains MAPPO (PPO where the observation is
+      not per agent) on each env with one shared config and adds its
+      greedy policy's row (`algos.ppo.Greedy`, now in the library). Not
+      yet run for the table: 24 envs at a few million steps each is a long
+      run, to be agreed first. Until then PPO numbers come from the
+      per-env scripts (`reproduce_elevator.py`, `bus_baselines.py`,
+      `train_baselines.py`, `disruption_eval.py`, `response_eval.py`).
 
 **Result.** [results.md](results.md): 14 envs × 2–4 baselines × 512
 episodes in about 2 minutes on the GTX 1080. Running every rule on every

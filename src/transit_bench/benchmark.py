@@ -105,13 +105,39 @@ def domain_metrics(env_id, env, rewards, info):
     return []
 
 
-def run(env_ids, n_episodes, seed=0):
-    """Rows of (env, policy, mean return, s.e., score, metrics)."""
+def ppo_config(env):
+    """The harness's PPO settings: MAPPO where the observation is one block
+    per agent, else PPO over the whole observation."""
+    from transit_bench.algos.ppo import PPOConfig
+
+    algo = "mappo" if env.per_agent_obs else "ppo"
+    return PPOConfig(
+        n_envs=512, n_steps=16, batch_size=2048, n_epochs=4, net_arch=(128, 128), algo=algo
+    )
+
+
+def trained(env_id, env, timesteps, seed=0):
+    """(name, greedy policy) after training on `env_id` for `timesteps`."""
+    from transit_bench.algos.ppo import Greedy, train
+
+    config = ppo_config(env)
+    params, _ = train(env_id, timesteps, config, seed=seed, verbose=False)
+    steps = f"{timesteps / 1e6:g}M" if timesteps >= 1e6 else f"{timesteps:,}"
+    return f"{config.algo} {steps}", Greedy(env, params)
+
+
+def run(env_ids, n_episodes, seed=0, ppo_timesteps=0):
+    """Rows of (env, policy, mean return, s.e., score, metrics). With
+    `ppo_timesteps`, also trains (MA)PPO on each env and adds its row."""
     rows = []
     for env_id in env_ids:
         env = make(env_id)
         results = {}
-        for name, policy in baselines(env_id, env).items():
+        policies = baselines(env_id, env)
+        if ppo_timesteps:
+            name, policy = trained(env_id, env, ppo_timesteps, seed)
+            policies[name] = policy
+        for name, policy in policies.items():
             rollout = jax.jit(make_rollout(env, policy, n_episodes, env.max_steps))
             rewards, info = rollout(jax.random.key(seed))
             returns = np.asarray(rewards).sum(axis=0)
@@ -156,9 +182,15 @@ def main(argv=None):
     parser.add_argument("--episodes", type=int, default=256)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--write", help="Markdown file to put the table in")
+    parser.add_argument(
+        "--ppo-timesteps",
+        type=int,
+        default=0,
+        help="also train (MA)PPO for this many steps on each env and add its row",
+    )
     args = parser.parse_args(argv)
     t0 = time.perf_counter()
-    rows = run(args.envs, args.episodes, args.seed)
+    rows = run(args.envs, args.episodes, args.seed, args.ppo_timesteps)
     table = markdown(rows, args.episodes)
     print(table)
     print(f"\n({time.perf_counter() - t0:.0f} s on {jax.devices()[0].platform})")
