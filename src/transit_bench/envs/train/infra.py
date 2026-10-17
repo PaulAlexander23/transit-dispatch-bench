@@ -104,6 +104,8 @@ class Infra(NamedTuple):
     # (trains, L + 1): at route index q, the first platform after q (-1 if none):
     # where a train entering a section at q will next stop.
     far_platform: np.ndarray
+    # (sections,) bool: used by trains in both directions (single track)
+    section_shared: np.ndarray
 
 
 def build(config: TrainConfig) -> Infra:
@@ -192,6 +194,12 @@ def build(config: TrainConfig) -> Infra:
                 if station_of[route[i, p]] >= 0:
                     far_platform[i, q] = route[i, p]
                     break
+    n_sections = int(section_of.max()) + 1
+    used = np.zeros((n_sections, 2), bool)
+    for i in range(T):
+        secs = section_of[route[i]]
+        used[secs[secs >= 0], direction[i]] = True
+    section_shared = used.all(axis=1)
     return Infra(
         n_blocks,
         station_of,
@@ -205,4 +213,5 @@ def build(config: TrainConfig) -> Infra:
         express,
         next_section,
         far_platform,
+        section_shared,
     )

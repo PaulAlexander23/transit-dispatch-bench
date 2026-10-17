@@ -363,3 +363,17 @@ def test_shield_vetoes_unsafe_go_and_makes_always_go_route_setting():
     state, _ = env.reset(jax.random.key(0))
     active = env.active_agents(state)
     assert not (active & env.vetoed(state)).any()
+
+
+def test_route_setting_lets_trains_follow_on_double_track():
+    """Only shared (single-track) sections need a free far platform; on a
+    double-track line route setting is first come, first served."""
+    assert not build(PRESETS["line"]).section_shared.any()
+    assert build(PRESETS["single"]).section_shared.all()
+    sim = TrainSim("passing")
+    sim.reset(0)
+    done = False
+    while not done:
+        assert route_setting(sim) == first_come_first_served(sim)
+        _, _, terminated, truncated, _ = sim.step(route_setting(sim))
+        done = terminated or truncated

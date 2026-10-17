@@ -374,8 +374,10 @@ def section_reservation(sim):
 def route_setting(sim):
     """Section reservation, and set the route through to the next platform.
 
-    As `section_reservation`, but a train also waits before a section until
-    the platform at its far end is free: station-to-station route setting.
+    As `section_reservation`, but before a section that carries both
+    directions (single track) a train also waits until the platform at its
+    far end is free: station-to-station route setting. On one-way sections
+    trains may follow each other in, as on a double-track line.
     Section reservation alone still deadlocks when trains bunch: an
     eastbound train on a platform waits for the next section, held by a
     westbound train waiting for the westbound platform, held by a train
@@ -392,6 +394,8 @@ def route_setting(sim):
         section = int(infra.section_of[b])
         here = int(infra.route[i][sim.pos[i]]) if sim.pos[i] != NOT_STARTED else -1
         if section < 0 or (here >= 0 and infra.section_of[here] == section):
+            continue
+        if not infra.section_shared[section]:
             continue
         far = int(infra.far_platform[i][sim.pos[i] + 1])
         if far >= 0 and sim.occupant[far] >= 0:

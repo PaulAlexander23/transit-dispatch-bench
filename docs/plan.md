@@ -425,9 +425,24 @@ them so far is a better rule, not RL.
 
 ### Phase 6: benchmark harness
 
-- [ ] One command runs random, heuristic and PPO on every env/preset over
+- [x] One command runs random, heuristic and PPO on every env/preset over
       seeds and writes a results table (normalised scores + domain metrics),
-      like the old repo's `benchmark.py --readme`.
+      like the old repo's `benchmark.py --readme`. Done for the baselines:
+      `python -m transit_bench.benchmark --write docs/results.md`; PPO rows
+      come from the per-env scripts for now (`reproduce_elevator.py`,
+      `bus_baselines.py`, `train_baselines.py`, `disruption_eval.py`).
+
+**Result.** [results.md](results.md): 14 envs × 2–4 baselines × 512
+episodes in about 2 minutes on the GTX 1080. Running every rule on every
+preset caught a regression at once: route setting was the train heuristic,
+and on double track it was *worse* than first come, first served (1.62 vs
+0.87 min per train on `line`), because waiting for a free far platform
+stops trains following each other into a one-way section. It now applies
+only to sections used in both directions (tested: on double track it is
+first come, first served); single-track numbers are unchanged. Lesson:
+normalising by the heuristic makes the heuristic part of the benchmark's
+definition, so it must be checked on every preset, not just the one it was
+designed for.
 
 ### Phase 7: coupled modes (stretch)
 

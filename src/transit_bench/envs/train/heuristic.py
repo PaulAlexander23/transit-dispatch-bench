@@ -73,8 +73,8 @@ class SectionReservation:
 class RouteSetting(SectionReservation):
     """Section reservation, and a free platform at the far end of the section.
 
-    `sim.route_setting` in JAX: a train joining a section also waits while
-    the first platform after it is occupied.
+    `sim.route_setting` in JAX: a train joining a section that carries both
+    directions also waits while the first platform after it is occupied.
     """
 
     def act(self, carry, state, key=None):
@@ -85,5 +85,7 @@ class RouteSetting(SectionReservation):
         index = jnp.minimum(state.pos + 1, far_table.shape[1] - 1)
         far = jnp.where(env.finished(state), -1, far_table[trains, index])
         taken = (far >= 0) & (state.occupant[jnp.maximum(far, 0)] >= 0)
-        wait = (env.joining(state) >= 0) & taken
+        joining = env.joining(state)
+        shared = jnp.asarray(env.infra.section_shared)[jnp.maximum(joining, 0)]
+        wait = (joining >= 0) & shared & taken
         return carry, jnp.where(wait, WAIT, actions).astype(jnp.int32)
