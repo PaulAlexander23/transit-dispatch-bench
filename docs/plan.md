@@ -24,8 +24,17 @@ normalised scores for every environment.
 |---|---|---|---|
 | `elevator` | Line (floors) | Move, serve, hall-call direction | Collective control |
 | `bus` | Loop / route graph | Hold, skip stop, short-turn | Headway-based holding |
-| `train` | Line / graph with track blocks | Dwell, reorder, reroute | Timetable + first-come-first-served |
-| `fleet` | Grid / road graph | Assign vehicle to request, reposition | Nearest idle vehicle |
+| `train` | Line / graph with track blocks | Order trains at conflicts, dwell, short-turn, reroute | Timetable + first-come-first-served; prioritised replanning |
+| `fleet` | Grid / road graph | Assign vehicle to request, reposition | Nearest idle vehicle; per-tick matching |
+
+Disruptions (closed edges, failed vehicles, demand surges) are a core process
+that every env can switch on, not a train-only feature. The headline direction
+is rail with disruptions: no JAX rail env turned up in the survey, and the
+strongest rail baselines are planners, so the suite pairs a fast env with a
+planning baseline and, on small presets, a hindsight-optimal bound.
+
+The maths is in [formulation.md](formulation.md); the survey in
+[related-work.md](related-work.md).
 
 ## Where this comes from
 
@@ -75,10 +84,13 @@ the JAX env alone steps ~0.68M env steps/s).
 
 ## Design
 
-- **Core** (`src/transit_bench/core/`): nodes, edges with travel times,
-  vehicles (position, capacity, onboard passengers), passenger slots (origin,
-  destination, arrival time, status), and a demand generator (time-varying
-  Poisson OD matrix). Pure functions over `NamedTuple` state.
+- **Core** (`src/transit_bench/core/`): nodes, edges with travel times
+  and a capacity and speed factor that can change over time (`κ_e(t)`,
+  `σ_e(t)`: a disruption is a write to these), vehicles (position, capacity,
+  onboard passengers, status), passenger slots (origin, destination, arrival
+  time, status), a demand generator (time-varying Poisson OD matrix) and a
+  disruption generator (Markov, semi-Markov or scripted outages). Pure
+  functions over `NamedTuple` state.
 - **Envs** (`src/transit_bench/envs/<name>/`): each is a core config plus its
   own action set, constraints, observation and reward. Each has a Python
   reference sim, a JAX env, a heuristic and presets.
@@ -98,9 +110,11 @@ the JAX env alone steps ~0.68M env steps/s).
 
 ### Phase 0: skeleton
 
-- [ ] Survey existing benchmarks (Flatland, Jumanji, RL4CO, SUMO-RL, OR-Gym,
+- [x] Survey existing benchmarks (Flatland, Jumanji, RL4CO, SUMO-RL, OR-Gym,
       bus-holding RL papers) and record in a short `docs/related-work.md`
       what each covers, so the suite's niche is stated with evidence.
+      Done: [related-work.md](related-work.md), and the maths in
+      [formulation.md](formulation.md).
 - [ ] `pyproject.toml` with uv: Python 3.12, `jax` / `jax-cuda` groups
       (CUDA 12 for the GTX 1080), optional `torch` cpu/cuda groups for the
       SB3 wrapper, `dev` group (pytest, ruff). Package `transit_bench`.
@@ -127,28 +141,66 @@ the JAX env alone steps ~0.68M env steps/s).
 - [ ] Presets: few stops/buses → realistic route; time-varying demand.
 - [ ] Python reference + parity tests; PPO/MAPPO results vs heuristic.
 
-### Phase 3: train line
+### Phase 3: train network
 
-- [ ] Env: one line, stations, track blocks (one train per block), dwell
-      decisions; disruptions (delays) injected at random.
-- [ ] Heuristic: keep to timetable, first-come-first-served at conflicts.
-- [ ] Metrics: total delay, passengers served, conflicts resolved.
+A job shop with blocking (see [formulation.md](formulation.md#train)). The
+action is an ordering choice at a conflict: which train enters a contested
+block first. Presets, one hard feature at a time:
 
-### Phase 4: on-demand fleet
+- [ ] `line`: double track, stations, track blocks (capacity 1), timetable.
+- [ ] `passing`: passing loops, mixed fast and slow trains (overtaking).
+- [ ] `single`: single track with crossing points; deadlock becomes possible.
+      Detect it in JAX by repeated squaring of the wait-for matrix.
+- [ ] `junction`: a small network with route choice.
+- [ ] Heuristics: keep to timetable with first-come-first-served at
+      conflicts; prioritised replanning (the Flatland 2020 winners' approach),
+      so RL is compared with a planner, not only a rule.
+- [ ] Metrics: total and weighted delay, passengers served, deadlocks,
+      conflicts resolved.
+- [ ] Hindsight bound on small presets: solve the alternative-graph MILP
+      after the episode with all disruptions known (e.g. HiGHS via `highspy`;
+      check the dependency first). Report each policy's gap to it.
+- [ ] Optional: load a few small DISPLIB instances as test networks.
+
+### Phase 4: disruptions
+
+- [ ] Core disruption process: edge outages (`κ_e = 0`), slow running
+      (`σ_e > 1`), vehicle failures, demand surges. Markov, semi-Markov
+      (lognormal durations, elapsed time observed) and scripted modes.
+- [ ] Observation switch: remaining outage time visible or hidden.
+- [ ] Train `blockage` preset with short-turn, cancel and reroute actions.
+- [ ] Switch disruptions on for elevator (car out of service) and bus
+      (road closure, breakdown).
+- [ ] Evaluation: in-distribution, shift (trained without, tested with),
+      and CVaR at 10% of delay alongside the mean.
+
+### Phase 5: on-demand fleet
 
 - [ ] Env: grid graph, requests with OD, vehicle assignment + repositioning.
-- [ ] Heuristic: nearest idle vehicle.
+- [ ] Heuristics: nearest idle vehicle; per-tick bipartite matching.
 
-### Phase 5: benchmark harness
+### Phase 6: benchmark harness
 
 - [ ] One command runs random, heuristic and PPO on every env/preset over
       seeds and writes a results table (normalised scores + domain metrics),
       like the old repo's `benchmark.py --readme`.
 
+### Phase 7: coupled modes (stretch)
+
+- [ ] Bus bridging: when a rail block closes, buses run a replacement
+      service between the affected stations. Train and bus envs share one
+      core state. No paper found does short-turning and bridging jointly.
+
 ## Backlog
 
 - GTFS loader for real bus and train networks and timetables.
 - Graph-network policies (the old repo has a GNN experiment in `scripts/gnn.py`).
+  Needed for rail generalisation: train on random networks (Flatland-style
+  generator), test on unseen ones and on DISPLIB networks.
+- Adversarial disruptions: a second agent picks which edge to block
+  (attacker–defender), for a worst-case robustness score.
+- RL proposes, a solver repairs: RL picks train orderings and a replanner
+  makes them feasible.
 - Semi-MDP / event-driven decisions, if fixed ticks prove too coarse.
 - Publish to GitHub (`PaulAlexander23/transit-dispatch-bench`, public);
   confirm with the user first.
@@ -156,5 +208,7 @@ the JAX env alone steps ~0.68M env steps/s).
 ## Open questions
 
 - Fixed tick length per env: one shared unit (seconds) or per-env?
+  Leaning: one shared unit (seconds), each env sets its tick length; coupled
+  modes (phase 7) need a common clock.
 - Single-agent central controller, multi-agent, or both as first-class?
   (The old repo had both; MAPPO was the newer path.)
