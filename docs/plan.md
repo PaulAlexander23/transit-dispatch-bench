@@ -958,6 +958,10 @@ is a loop of 8 stops with 4 buses, at about the train's 10-minute headway.
   Extensions: a shared lift shaft on `elevator`, capacity-1 nodes on
   `fleet` (warehouse robots), and a throughput objective with cyclic jobs
   (mine haul roads).
+- Paper references: check and complete the references in
+  applications.md (cited from memory) and add them to related-work.md.
+- When the backlog runs low, revisit [applications.md](applications.md):
+  assess more applications and pick the next new core from it.
 
 - Corridor: a crowding-aware `transfer_cost` (room on the next bus, the
   dwell the extra boarding adds for everyone on board); bus holding for
