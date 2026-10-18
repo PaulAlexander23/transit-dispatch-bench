@@ -26,6 +26,9 @@ replacement buses: BRIDGE ends a trip and sends a bus to serve its calls.
 train's riders move to the bus route, and everyone's cost is counted in
 passenger-minutes.
 
+Which other transport problems these models cover, and which would need a
+new model: [docs/applications.md](docs/applications.md).
+
 ```sh
 uv sync --group jax-cuda            # or plain `uv sync` for CPU JAX
 uv run pytest                       # tests, including step-for-step parity
