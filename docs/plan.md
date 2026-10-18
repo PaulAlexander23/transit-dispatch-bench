@@ -826,7 +826,123 @@ line; bridging pays when missed calls are dear.
     bridged call can save at most 5 minutes, and a bus that has to come
     from the depot is often later than that.
 
+- [x] Coupled corridor (`corridor/*`): the train line and a bus route
+      along it in one state, with one clock, one network and one
+      passenger model. A short-turned train's riders move to the bus.
+
+**Design.** The three things the two envs have to share, and the choice
+made for each:
+
+- **Clock.** One tick for both (`step_seconds` must agree). Within a tick,
+  the trains act first, then stranded riders join the bus stops, then the
+  buses act. So a bus at that stop can board them in the same tick.
+- **Network.** The bus route is built from the rail line: a loop of
+  2(n − 1) stops, out along the stations and back. Stop s is station s
+  eastbound, and stop 2(n − 1) − s is station s westbound (the two end
+  stations are shared). Each bus edge takes the road time of one section
+  (`bus_slowdown` x the stopping train's running time, as for bridging).
+  Rail blockages and road closures stay independent processes: a
+  correlated one (one flood closing both) is a backlog item.
+- **Passengers.** Each train leaves its origin with `riders_per_call`
+  riders for each later call. That is the simplest rail model with a
+  destination per rider, which is what a transfer needs. While a train
+  runs, every rider still on board pays its projected lateness: weight
+  r x (calls left) on the change in the train's projected delay each
+  tick. Summed, a rider's cost is about the train's lateness at their
+  stop. If the train terminates, its riders get off at that station (or
+  never left the origin). They join the bus stop for that station in the
+  train's direction, each with the bus stop of their own call as
+  destination. From then on they are ordinary bus passengers and pay bus
+  passenger-minutes (waiting and riding). This replaces the train env's
+  fixed missed-call penalty with a cost the bus state decides.
+- **Common units.** The reward is minus passenger-minutes over everyone.
+  For rail riders that means lateness; for bus riders, all their time.
+  To put transferred riders on the lateness scale, each one earns a
+  credit of 1 minute per minute from the transfer until its scheduled
+  arrival plus the lateness already charged (`credit_end`). Over an
+  episode a transferred rider then costs its bus arrival minus its
+  scheduled train arrival. The credit is paid per tick rather than all
+  at once: a lump at the transfer would make terminating look good
+  straight away, followed by a slow bill (a credit-assignment trap for
+  RL). Paid per tick, the reward comes to zero while the bus keeps them
+  on time.
+- **Agents.** The trains and then the buses, with the train's action set
+  (GO, WAIT, TERMINATE). For a bus, 0 is GO and anything else is HOLD.
+  The observation has one block per agent: a type flag, the agent's own
+  env features padded to the longer of the two, and two coupling fields
+  for trains. These are the expected wait for the next bus at its station
+  in its direction, and the expected extra journey time by bus over the
+  train for its riders (`transfer_cost`).
+- **The joint rule.** `TerminateWhenStuck` with the bus in the loop. A
+  train held at a closed block terminates when factor x the outage's
+  expected time left exceeds `transfer_cost`, its riders' mean extra time
+  by bus. That cost is: the wait until the next bus reaches the station,
+  plus the nominal bus ride to each call, minus the train's timetabled
+  time there. The fixed penalty x missed calls becomes a quantity read
+  from where the buses are. Baselines: no termination (route setting +
+  headway holding), and the bus-blind rule (the fixed 5-minute penalty).
+- **Why composition.** The corridor sim holds a `TrainSim` and a
+  `BusSim`, and the JAX env holds a `TrainState` and a `BusState`. The
+  coupling sits between their steps (the bus stops' waiting counts, the
+  credits), so neither env changes and both keep their parity tests.
+  The cost is that the rail passenger model stays coarse, at the
+  corridor level: a full one (per-station boarding, train capacity)
+  belongs in the train env (backlog).
+
+**Result.** `corridor/corridor-v0` and `busy-v0` (twice the bus demand).
+The JAX env matches the Python reference step for step, under random play
+and all three rules (`tests/test_corridor.py`). The rail line is
+`blockage` with TERMINATE: single track, 10-minute outages. The bus route
+is a loop of 8 stops with 4 buses, at about the train's 10-minute headway.
+
+- **Results** (`scripts/corridor_eval.py`; 2,048 episodes, seed 7;
+  passenger-minutes per episode; "vs blind" is the paired difference to
+  the bus-blind rule at factor 2):
+
+  | Policy | `corridor`: cost | vs blind | rail | bus | terminated/ep | `busy`: vs blind |
+  |---|---|---|---|---|---|---|
+  | No termination | 10,362 | +166 ± 16 | 675 | 9,687 | 0 | +150 ± 15 |
+  | Bus-blind, factor 1 | 10,283 | +88 ± 11 | 585 | 9,698 | 0.14 | +72 ± 10 |
+  | Bus-blind, factor 2 | 10,195 | 0 | 441 | 9,754 | 0.37 | 0 |
+  | **Bus-aware, factor 2** | **10,175** | **−20 ± 5** | 382 | 9,793 | 0.45 | −6 ± 5 |
+  | Bus-blind, factor 4 | 10,175 | −20 ± 5 | 382 | 9,793 | 0.45 | −6 ± 5 |
+
+- **What was learned.**
+  - Terminating a blocked train pays once a bus is there to take its
+    riders: 166 passenger-minutes an episode (1.6% of the total, but
+    25% of the rail riders' share once the bus's extra cost is netted off). Rail lateness falls from 675 to 382; the bus pays
+    back 106 of that for about 10 transferred riders, roughly 10 minutes
+    late each.
+  - The bus-aware rule wins by terminating *more* (0.45 vs 0.37 trains per
+    episode), not by timing it to where the buses are. Its estimated cost
+    (a few minutes of extra journey) is nearly always below factor x the
+    10-minute outage, so it makes the same choices as the bus-blind rule
+    at factor 4, which is "terminate whenever blocked". At smaller
+    factors, where the bus's position would tip decisions (0.25–0.75),
+    the paired differences are within ±5 passenger-minutes, i.e. noise.
+    The fixed 5-minute penalty overstates what a transfer costs when a
+    bus runs alongside every 10 minutes.
+  - Transfers cost more on a busy route: the gain over bus-blind drops
+    from 20 to 6 (not significant), because transferred riders crowd the
+    buses and slow boarding for everyone. `transfer_cost` ignores
+    crowding, so a rule (or a learner) that priced it would do better
+    there. That is a backlog item, and a place where coupling matters
+    that a single-mode env cannot show.
+  - The normalised score is dominated by the bus: random play holds
+    buses (2 of its 3 actions are HOLD), which costs far more than any
+    train decision. The rail rules sit between 0.95 and 1.00. Paired
+    differences in passenger-minutes are the meaningful comparison here;
+    the harness reports rail and bus costs separately for that reason.
+
 ## Backlog
+
+- Corridor: a crowding-aware `transfer_cost` (room on the next bus, the
+  dwell the extra boarding adds for everyone on board); bus holding for
+  transfers (connection protection); a rail passenger model inside the
+  train env (boarding per station, capacity), so riders waiting at missed
+  calls count too; correlated disruptions across modes (one event
+  closing a rail block and the road beside it); MAPPO on the corridor,
+  where trains and buses share one policy with a type flag.
 
 - GTFS loader for real bus and train networks and timetables.
 - Graph-network policies (the old repo has a GNN experiment in `scripts/gnn.py`).

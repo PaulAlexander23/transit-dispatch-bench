@@ -58,6 +58,11 @@ def baselines(env_id, env):
 
         out["nearest idle"] = NearestIdle(env)
         out["matching"] = Matching(env)
+    if family == "corridor":
+        from transit_bench.envs.corridor.heuristic import BusBlind, NoTermination
+
+        out["no termination"] = NoTermination(env)
+        out["bus-blind terminate"] = BusBlind(env)
     out["heuristic"] = env.heuristic()
     return out
 
@@ -103,6 +108,16 @@ def domain_metrics(env_id, env, rewards, info):
             ("served/ep", f"{picked.mean():.1f}"),
             ("lost", f"{lost.sum() / max(picked.sum() + lost.sum(), 1):.3f}"),
             ("mean wait", f"{wait / 60:.1f} min"),
+        ]
+    if family == "corridor":
+        bus = info["bus_cost"].sum(axis=0) - info["credit"].sum(axis=0)
+        n = max(info["departures"].sum(), 1)
+        return [
+            ("rail/ep", f"{info['rail_cost'].sum(axis=0).mean():.0f}"),
+            ("bus/ep", f"{bus.mean():.0f}"),
+            ("terminated/ep", f"{info['terminated'].sum(axis=0).mean():.2f}"),
+            ("transferred/ep", f"{info['transferred'].sum(axis=0).mean():.1f}"),
+            ("bunching", f"{info['bunched'].sum() / n:.3f}"),
         ]
     return []
 

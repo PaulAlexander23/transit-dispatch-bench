@@ -161,7 +161,8 @@ class TerminateWhenStuck:
     or the mean outage length) times `factor` exceeds the penalty for its
     missed calls; and
     of the deadlocked trains that can terminate, the one missing fewest
-    calls (lowest index on a tie) terminates.
+    calls (lowest index on a tie) terminates. `act`'s `cost`, if given,
+    is per train the seconds terminating costs in place of the penalty.
     """
 
     def __init__(self, env, rule=None, factor=2.0):
@@ -171,7 +172,7 @@ class TerminateWhenStuck:
     def init(self):
         return self.rule.init()
 
-    def act(self, carry, state, key=None):
+    def act(self, carry, state, key=None, cost=None):
         carry, actions = self.rule.act(carry, state, key)
         env, c = self.env, self.env.config
         T = env.n_trains
@@ -183,7 +184,7 @@ class TerminateWhenStuck:
         else:
             left = jnp.full(T, c.disruption.mean_seconds)
         missed = env.missed_calls(state)
-        penalty = 60 * c.terminate_penalty * missed
+        penalty = 60 * c.terminate_penalty * missed if cost is None else cost
         can_bridge = env.can_bridge(state)
         bridged = 60 * env.bridge_plan(state)[0]
         buses = (state.bus_free <= state.t).sum(dtype=jnp.int32)
@@ -194,8 +195,8 @@ class TerminateWhenStuck:
             return jnp.where(use, BRIDGE, TERMINATE), jnp.where(use, bridged[i], penalty[i])
 
         for i in range(T):  # buses are handed out in train order
-            action, cost = end(i, buses)
-            go = can[i] & closed[i] & (self.factor * left[i] > cost)
+            action, price = end(i, buses)
+            go = can[i] & closed[i] & (self.factor * left[i] > price)
             actions = actions.at[i].set(jnp.where(go, action, actions[i]))
             buses = buses - (go & (action == BRIDGE))
         dead = env.deadlocked(state) & can

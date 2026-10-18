@@ -144,6 +144,31 @@ is optimal. It runs in JAX as a `while_loop` of vectorised bidding rounds
 exactly. Dummy "stay" objects, dearer than any pickup, make it serve as
 many requests as it can before minimising distance.
 
+### Coupled corridor
+
+The train and bus envs joined in one state (`corridor/*`). Each mode's
+model is unchanged; what couples them is the passengers. Let train i carry
+r riders for each call q after its origin. The objective is total
+passenger lateness:
+
+    min  Σ_i Σ_q r · late_iq
+
+late_iq is the train's lateness at q if it keeps running. If it
+terminates at station s at time τ, it is the bus arrival at q's stop minus
+sched_iq. Terminating replaces a fixed penalty per missed call with a
+quantity set by the bus system: the wait for a bus with room, the ride,
+and the delay that the extra boarding causes everyone already on board.
+This is an integrated disruption-management problem of the kind studied
+for rail–bus bridging (e.g. Kepaptsoglou & Karlaftis 2009; Jin et al.
+2016), here made online and sequential.
+
+Per tick, the env charges each rail rider still on board the change in
+its train's projected lateness. It charges each bus rider the tick, and
+credits each transferred rider until their scheduled arrival plus the
+lateness already charged. These sum to the objective, but the credit
+comes per tick: a lump credit at the transfer would make terminating look
+good at once and be billed later, a credit-assignment trap for RL.
+
 ## Disruptions as a stochastic process
 
 Each edge has a state `z_e ∈ {up, down}`.

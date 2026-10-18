@@ -2,7 +2,7 @@
 
 Reinforcement learning benchmark environments for passenger dispatch on
 transport networks, built on one shared JAX core: elevators, buses and
-trains so far, with on-demand fleets planned. Every env has a slow,
+trains, on-demand fleets, and a train line coupled with a bus route. Every env has a slow,
 readable Python reference it is tested against step for step, a classical
 heuristic, and a normalised score (random = 0, heuristic = 1).
 
@@ -12,6 +12,7 @@ heuristic, and a normalised score (random = 0, heuristic = 1).
 | `bus/*` | Loop of stops | Go or hold, per deciding bus | Headway-based holding |
 | `train/*` | Blocks of track, double or single | Go or wait (or terminate, or divert), per deciding train | Route setting, giving way to expresses, rerouting |
 | `fleet/*` | Grid of nodes | Stay, move, or take a waiting request, per idle vehicle | Per-tick matching (exact auction) with rebalancing |
+| `corridor/*` | A single-track line and a bus loop along it | Train actions (incl. terminate) and bus go/hold, in one state | Terminate when stuck, at a cost read from the buses; headway holding |
 
 Disruptions (blocked or slowed edges; Markov, semi-Markov or scripted) are a
 core process (as are vehicle breakdowns, on `bus/breakdown-v0` and
@@ -21,6 +22,9 @@ adds a TERMINATE action (cancel or short-turn a train, at a cost per missed
 call). `train/junction-v0` adds route choice: relief tracks alongside two
 sections, and a DIVERT action to take them. `train/bridge-v0` adds
 replacement buses: BRIDGE ends a trip and sends a bus to serve its calls.
+`corridor/*` couples the train and bus envs in one state. A terminated
+train's riders move to the bus route, and everyone's cost is counted in
+passenger-minutes.
 
 ```sh
 uv sync --group jax-cuda            # or plain `uv sync` for CPU JAX

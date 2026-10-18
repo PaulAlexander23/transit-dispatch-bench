@@ -26,6 +26,14 @@ Baselines over 512 episodes each (seed 0). Score: random = 0, the env's heuristi
 | `bus/peak-v0` | random | -1712.0 ± 4.2 | 0.00 | mean wait 404 s, headway CV 0.76, bunching 0.101 |
 | `bus/peak-v0` | always go | -1581.5 ± 4.4 | 0.76 | mean wait 347 s, headway CV 0.83, bunching 0.153 |
 | `bus/peak-v0` | heuristic | -1539.6 ± 3.5 | 1.00 | mean wait 288 s, headway CV 0.46, bunching 0.000 |
+| `corridor/busy-v0` | random | -24682.8 ± 59.7 | 0.00 | rail/ep 174, bus/ep 24509, terminated/ep 7.71, transferred/ep 280.9, bunching 0.023 |
+| `corridor/busy-v0` | no termination | -20920.7 ± 68.6 | 0.96 | rail/ep 671, bus/ep 20250, terminated/ep 0.00, transferred/ep 0.0, bunching 0.000 |
+| `corridor/busy-v0` | bus-blind terminate | -20746.5 ± 50.5 | 1.00 | rail/ep 410, bus/ep 20337, terminated/ep 0.33, transferred/ep 6.9, bunching 0.000 |
+| `corridor/busy-v0` | heuristic | -20743.7 ± 49.5 | 1.00 | rail/ep 350, bus/ep 20394, terminated/ep 0.43, transferred/ep 10.7, bunching 0.000 |
+| `corridor/corridor-v0` | random | -13177.5 ± 44.2 | 0.00 | rail/ep 174, bus/ep 13004, terminated/ep 7.71, transferred/ep 280.9, bunching 0.041 |
+| `corridor/corridor-v0` | no termination | -10358.8 ± 61.0 | 0.93 | rail/ep 671, bus/ep 9688, terminated/ep 0.00, transferred/ep 0.0, bunching 0.000 |
+| `corridor/corridor-v0` | bus-blind terminate | -10161.4 ± 40.1 | 0.99 | rail/ep 410, bus/ep 9752, terminated/ep 0.33, transferred/ep 6.9, bunching 0.000 |
+| `corridor/corridor-v0` | heuristic | -10142.3 ± 38.0 | 1.00 | rail/ep 350, bus/ep 9792, terminated/ep 0.43, transferred/ep 10.7, bunching 0.000 |
 | `elevator/full-v0` | random | 6.1 ± 0.1 | 0.00 | delivered/ep 6.1 |
 | `elevator/full-v0` | heuristic | 67.1 ± 0.2 | 1.00 | delivered/ep 67.1 |
 | `elevator/hall_calls-v0` | random | 5.7 ± 0.1 | 0.00 | delivered/ep 5.7 |

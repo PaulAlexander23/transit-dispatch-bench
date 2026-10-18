@@ -621,7 +621,7 @@ def reroute(sim, rule=route_setting):
     return actions
 
 
-def terminate_when_stuck(sim, rule=route_setting, factor=2.0):
+def terminate_when_stuck(sim, rule=route_setting, factor=2.0, cost=None):
     """`rule`, plus TERMINATE where waiting looks dearer than the missed calls.
 
     A train that can terminate does so when its next block is closed and
@@ -640,6 +640,8 @@ def terminate_when_stuck(sim, rule=route_setting, factor=2.0):
     bridging (`bridge_plan`); free buses go to trains in index order, and
     the threshold above uses that cheaper cost, so buses make terminating
     worth it more often.
+    `cost`, if given, is per train the seconds that terminating costs in
+    place of the penalty (the corridor env's `transfer_cost`).
     """
     actions = list(rule(sim))
     c = sim.config
@@ -649,7 +651,7 @@ def terminate_when_stuck(sim, rule=route_setting, factor=2.0):
     def end(i):
         """The cheaper way to end train i's trip: (action, cost in seconds)."""
         nonlocal buses
-        penalty = 60 * c.terminate_penalty * sim.missed_calls(i)
+        penalty = 60 * c.terminate_penalty * sim.missed_calls(i) if cost is None else cost[i]
         if buses > 0 and sim.can_bridge(i):
             bridged = 60 * sim.bridge_plan(i)[0]
             if bridged < penalty:
@@ -664,8 +666,8 @@ def terminate_when_stuck(sim, rule=route_setting, factor=2.0):
             continue
         d = sim.disruption
         left = d.remaining[b] if c.disruption.observe_remaining else c.disruption.mean_seconds
-        action, cost = end(i)
-        if factor * left > cost:
+        action, price = end(i)
+        if factor * left > price:
             actions[i] = action
             buses -= action == BRIDGE
     stuck = sim.deadlocked_trains()

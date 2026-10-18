@@ -30,7 +30,7 @@ def registered():
 def _register_builtin():
     from functools import partial
 
-    from transit_bench.envs import bus, elevator, fleet, train
+    from transit_bench.envs import bus, corridor, elevator, fleet, train
 
     for preset in elevator.PRESETS:
         register(f"elevator/{preset}-v0", partial(elevator.ElevatorEnv, preset))
@@ -40,6 +40,8 @@ def _register_builtin():
         register(f"train/{preset}-v0", partial(train.TrainEnv, preset))
     for preset in fleet.PRESETS:
         register(f"fleet/{preset}-v0", partial(fleet.FleetEnv, preset))
+    for preset in corridor.PRESETS:
+        register(f"corridor/{preset}-v0", partial(corridor.CorridorEnv, preset))
 
 
 _register_builtin()
