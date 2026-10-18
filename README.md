@@ -2,7 +2,8 @@
 
 Reinforcement learning benchmark environments for passenger dispatch on
 transport networks, built on one shared JAX core: elevators, buses and
-trains, on-demand fleets, and a train line coupled with a bus route. Every env has a slow,
+trains, on-demand fleets, a train line coupled with a bus route, and a
+runway's landing sequence. Every env has a slow,
 readable Python reference it is tested against step for step, a classical
 heuristic, and a normalised score (random = 0, heuristic = 1).
 
@@ -13,6 +14,7 @@ heuristic, and a normalised score (random = 0, heuristic = 1).
 | `train/*` | Blocks of track, double or single, on a line or any network | Go or wait (or terminate, or divert), per deciding train | Route setting, giving way to expresses, rerouting |
 | `fleet/*` | Grid of nodes | Stay, move, or take a waiting request, per idle vehicle | Per-tick matching (exact auction) with rebalancing |
 | `corridor/*` | A single-track line and a bus loop along it | Train actions (incl. terminate) and bus go/hold, in one state | Terminate when stuck, at a cost read from the buses; headway holding |
+| `runway/*` | One runway, with separations that depend on both aircraft | Wait, or land one waiting aircraft | Constrained position shifting |
 
 Disruptions (blocked or slowed edges; Markov, semi-Markov or scripted) are a
 core process (as are vehicle breakdowns, on `bus/breakdown-v0` and
@@ -26,7 +28,9 @@ sections, and a DIVERT action to take them. `train/bridge-v0` adds
 replacement buses: BRIDGE ends a trip and sends a bus to serve its calls.
 `corridor/*` couples the train and bus envs in one state. A terminated
 train's riders move to the bus route, and everyone's cost is counted in
-passenger-minutes.
+passenger-minutes. `runway/*` sequences aircraft landing on one runway,
+where the gap between two landings depends on both (wake turbulence); its
+hindsight bound is an exact dynamic programme.
 
 Which other transport problems these models cover, and which would need a
 new model: [docs/applications.md](docs/applications.md).
@@ -36,6 +40,7 @@ uv sync --group jax-cuda            # or plain `uv sync` for CPU JAX
 uv run pytest                       # tests, including step-for-step parity
 uv run python -m transit_bench.benchmark --write docs/results.md
 uv run --extra bound python scripts/bound_eval.py   # gaps to the hindsight-optimal schedule
+uv run python scripts/runway_eval.py                # the same for the runway rules
 uv run python -m transit_bench.algos.ppo --env elevator/full-v0 --pretrain 100000 \
     --n-envs 1024 --n-steps 8 --batch-size 2048 --n-epochs 10 \
     --learning-rate 5.2e-5 --timesteps 10000000

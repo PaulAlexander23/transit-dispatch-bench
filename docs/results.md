@@ -60,6 +60,18 @@ Baselines over 512 episodes each (seed 0). Score: random = 0, the env's heuristi
 | `fleet/grid-v0` | nearest idle | -394.8 ± 6.1 | 0.88 | served/ep 115.3, lost 0.022, mean wait 3.0 min |
 | `fleet/grid-v0` | matching | -293.2 ± 3.5 | 0.99 | served/ep 115.9, lost 0.021, mean wait 2.1 min |
 | `fleet/grid-v0` | heuristic | -285.5 ± 3.4 | 1.00 | served/ep 116.0, lost 0.020, mean wait 2.1 min |
+| `runway/closure-v0` | random | -383.4 ± 6.1 | 0.00 | delay/aircraft 10.77 min, landed/ep 25.5, rejected/ep 0.01 |
+| `runway/closure-v0` | first come first served | -148.8 ± 5.7 | 0.92 | delay/aircraft 4.18 min, landed/ep 31.6, rejected/ep 0.01 |
+| `runway/closure-v0` | heuristic | -129.3 ± 5.1 | 1.00 | delay/aircraft 3.63 min, landed/ep 32.2, rejected/ep 0.01 |
+| `runway/lookahead-v0` | random | -263.2 ± 4.3 | 0.00 | delay/aircraft 8.82 min, landed/ep 21.7, rejected/ep 0.07 |
+| `runway/lookahead-v0` | first come first served | -84.1 ± 3.2 | 0.92 | delay/aircraft 2.84 min, landed/ep 27.3, rejected/ep 0.00 |
+| `runway/lookahead-v0` | heuristic | -69.0 ± 2.7 | 1.00 | delay/aircraft 2.33 min, landed/ep 27.9, rejected/ep 0.00 |
+| `runway/mixed-v0` | random | -348.1 ± 5.3 | 0.00 | delay/aircraft 9.79 min, landed/ep 26.9, rejected/ep 0.00 |
+| `runway/mixed-v0` | first come first served | -108.3 ± 4.0 | 0.94 | delay/aircraft 3.04 min, landed/ep 33.0, rejected/ep 0.00 |
+| `runway/mixed-v0` | heuristic | -91.8 ± 3.3 | 1.00 | delay/aircraft 2.58 min, landed/ep 33.5, rejected/ep 0.00 |
+| `runway/peak-v0` | random | -489.3 ± 7.5 | 0.00 | delay/aircraft 13.60 min, landed/ep 30.0, rejected/ep 0.03 |
+| `runway/peak-v0` | first come first served | -245.3 ± 7.6 | 0.88 | delay/aircraft 6.82 min, landed/ep 34.7, rejected/ep 0.01 |
+| `runway/peak-v0` | heuristic | -213.2 ± 6.7 | 1.00 | delay/aircraft 5.93 min, landed/ep 35.1, rejected/ep 0.00 |
 | `train/blockage-v0` | random | -105.0 ± 4.1 | 0.00 | delay/train 13.13 min, CVaR10 35.80 min, deadlocks 0.525 |
 | `train/blockage-v0` | first come first served | -68.2 ± 4.1 | 0.45 | delay/train 8.53 min, CVaR10 34.25 min, deadlocks 0.373 |
 | `train/blockage-v0` | section reservation | -34.3 ± 2.9 | 0.87 | delay/train 4.29 min, CVaR10 26.66 min, deadlocks 0.109 |

@@ -176,6 +176,38 @@ lateness already charged. These sum to the objective, but the credit
 comes per tick: a lump credit at the transfer would make terminating look
 good at once and be billed later, a credit-assignment trap for RL.
 
+### Runway
+
+One runway and aircraft arriving to land (`runway/*`). Aircraft j has a
+wake class c_j and an earliest landing tick E_j (its ETA), and lands at
+tick t_j. The objective is total delay:
+
+    min  Σ_j (t_j − E_j)
+    s.t. t_j ≥ E_j
+         t_j − t_i ≥ S[c_i, c_j]   if j lands right after i
+         t_j not in a closed tick
+
+S is the wake separation: a heavy aircraft ahead of a small one needs
+196 s, a small ahead of a heavy 60 s. This is single-machine scheduling
+with release times and **sequence-dependent setup times** (the aircraft
+landing problem, Beasley et al. 2000). The train env never had the
+second constraint: there, a train's time in a block depends only on that
+train. Here the cost of serving an aircraft depends on which one went
+before, which makes the problem closer to an asymmetric travelling
+salesman problem than to a job shop. Landing in ETA order (FCFS) wastes
+capacity on large gaps; reordering to group classes saves it, at the
+price of fairness. Constrained position shifting (Dear 1976) allows each
+aircraft to move at most k places from its FCFS position.
+
+The hindsight bound is exact. Aircraft of one class are interchangeable,
+so an optimal sequence lands each class in ETA order, and a sequence is
+determined by the order of classes. The DP state is the count landed per
+class and the last class (Psaraftis 1980). Release times add one twist:
+two partial sequences reaching a state can trade off the last landing
+tick against the cost so far, so each state keeps the Pareto front of
+(tick, cost). The cost still to come is non-decreasing in the tick, so
+the front is all that matters and the DP stays exact.
+
 ## Disruptions as a stochastic process
 
 Each edge has a state `z_e ∈ {up, down}`.
