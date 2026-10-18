@@ -1012,12 +1012,130 @@ worked on routes over blocks.
     analysis of where the bound's schedules differ from route setting
     (as `give way to express` came out of the `passing` schedules).
 
+### Phase 9: runway sequencing
+
+The first new core from [applications.md](applications.md): one runway,
+aircraft arriving to land, and a minimum gap between two landings that
+depends on both aircraft (wake turbulence). The train env's blocks never
+had this: a train's time in a block depends only on that train. Here the
+cost of serving an aircraft depends on the one served before it, which
+makes the problem single-machine scheduling with sequence-dependent setup
+times and release times (the aircraft landing problem).
+
+**Model** (ticks of 10 s):
+- **Aircraft** arrive as a Poisson process, each with a wake class
+  (heavy, large or small, drawn from a mix). An aircraft is *announced*
+  `notice` ticks before its earliest landing time E (its ETA) and waits
+  in a buffer of `max_aircraft` slots. An arrival that finds the buffer
+  full is rejected (a diversion), with a penalty.
+- **Separation.** Landing aircraft j at tick t after aircraft i landed at
+  tick s needs t − s ≥ S[class i, class j] (seconds, rounded up to
+  ticks). The matrix used is the standard one from the runway-scheduling
+  literature (heavy before small 196 s, small before heavy 60 s; checked
+  against the source in the references item). It satisfies the triangle
+  inequality, so only consecutive pairs need checking.
+- **Decision.** One controller, each tick: WAIT, or LAND slot r. A LAND is
+  carried out if the aircraft's E has passed, the separation from the last
+  landing has elapsed and the runway is open; otherwise it is a WAIT.
+- **Cost.** Each tick, minus the aircraft-minutes of aircraft past their
+  E and not yet landed, and a penalty per rejection. An episode's return
+  is minus the total landing delay Σ (min(land, T) − E).
+- **Disruptions.** The runway is one edge of the shared process: closed
+  for a random time (weather, snow clearance, an incident).
+
+**Rules.**
+- *First come, first served* (FCFS): land in order of E, each as soon as
+  allowed. What controllers mostly do, and the classical baseline.
+- *Constrained position shifting* (CPS, Dear 1976; Balakrishnan and
+  Chandran 2010): reorder for shorter separations, but no aircraft moves
+  more than k places from its FCFS position. Online version: each tick,
+  enumerate the orders of the first m waiting aircraft (by E) that keep
+  every aircraft within k places and its total overtakes at most k; pick
+  the order with the least total landing time (plus a tail term for the
+  aircraft behind); land its first aircraft if it can go now. k = 0 is
+  FCFS. The env's heuristic is CPS with k = 2, m = 5.
+
+**Hindsight bound.** Knowing every aircraft, the best landing sequence is
+an exact dynamic programme. Aircraft of the same class are interchangeable
+(same separations), so an optimal sequence lands each class in order of
+E (an exchange argument). The state is then the number landed of each
+class and the class of the last landing (Psaraftis 1980), plus the tick
+of the last landing. Keeping, per state, the Pareto front of (last tick,
+cost so far) makes the DP exact with release times and closures: the cost
+still to come only grows with the last tick. A few thousand states per
+hour of traffic, so it solves in well under a second in Python.
+
+- [x] **Python reference** (`envs/runway/sim.py`): config, presets,
+      arrivals, separations, closures, observation; FCFS and CPS rules.
+- [x] **JAX env** with step-for-step parity, and the rules in JAX.
+- [x] **Hindsight bound** (`envs/runway/bound.py`), tested against
+      brute force on small instances and against every episode.
+- [x] **Presets.** `mixed` (36 aircraft an hour, near FCFS capacity),
+      `peak` (an arrival bank above capacity, then a lull), `lookahead`
+      (`mixed` announced 10 minutes ahead), `closure` (`mixed` with
+      random runway closures).
+- [x] **Harness, registry, docs and an evaluation** of the rules against
+      the bound.
+- Deferred: departures and mixed-mode runways (departure–arrival
+  separations); several runways; time windows (a latest landing time,
+  fuel); ETA uncertainty (the announced E is a forecast); passenger
+  weights per class; a rolling-horizon exact planner (the DP on the
+  known aircraft) as the look-ahead policy class.
+
+**Result.** `runway/*` has a Python reference, a JAX env with step-for-step
+parity (all four presets, random and rule-driven), FCFS and CPS rules in
+both, and an exact hindsight bound. 27 tests: the env's rules (ETA,
+separation, closures, overtakes, rejections), JAX against Python, the DP
+against brute force over every landing order on small instances (with
+closures), and the DP's schedule feasible and below every episode.
+
+- **One fix on the way.** CPS first required every aircraft to stay at
+  most k overtakes in all. Once another controller (or a different k) had
+  overtaken an aircraft more, no order was allowed and the rule had
+  nothing to pick. Now an order may not *add* overtakes beyond k, so FCFS
+  order is always allowed.
+- **Results** (`scripts/runway_eval.py`, 200 scenarios per preset, the
+  same scenarios for every rule; minutes of delay per aircraft due in
+  the hour; no episode had a rejection):
+
+  | Preset | Bound | FCFS | CPS k=1 | CPS k=2 (heuristic) | CPS k=3, window 6 |
+  |---|---|---|---|---|---|
+  | `mixed` | 2.03 | 2.90 (30%) | 2.62 (23%) | 2.50 (19%) | 2.42 (16%) |
+  | `peak` | 4.20 | 6.37 (34%) | 5.75 (27%) | 5.50 (24%) | 5.31 (21%) |
+  | `lookahead` | 1.94 | 2.70 (28%) | 2.38 (19%) | 2.25 (14%) | 2.16 (11%) |
+  | `closure` | 2.76 | 3.91 (30%) | 3.55 (22%) | 3.39 (19%) | 3.27 (16%) |
+
+  (In brackets: the share of the rule's delay above the bound. CPS k=2
+  saves 14 ± 1 minutes an episode over FCFS on `mixed`, 31 ± 2 on
+  `peak`. The DP takes 0.01 s per scenario, about 2,400 states.)
+- **What was learned.**
+  - Structure beats a general solver: the train bound is a MILP taking
+    seconds to a minute per scenario, sometimes not reaching optimality.
+    The runway bound is exact in 0.01 s, because interchangeable aircraft
+    collapse the state to counts per class. The Pareto front is what
+    keeps it exact with release times.
+  - Each extra place of shifting helps (k = 1, 2, 3 recover about 30%,
+    45% and 55% of FCFS's excess over the bound). k is a fairness limit,
+    and these numbers are its price.
+  - Notice helps the planner. With aircraft announced 10 minutes ahead,
+    CPS recovers 59% of FCFS's excess (k = 2) against 46% without. Its
+    window holds aircraft that have not reached the runway yet. (The
+    absolute delays are not comparable between `lookahead` and `mixed`:
+    `lookahead` starts with 10 minutes in which nothing is due, so fewer
+    aircraft count.)
+  - 11–24% of CPS's delay is still above the bound. Three things share
+    it: the window and shift limit, the greedy first step, and not
+    knowing future arrivals. A rolling-horizon DP on the known aircraft
+    (backlog) would separate the third from the first two. That gap is
+    the room for a learner.
+  - The harness's normalised score compresses this: random lands
+    aircraft often enough that FCFS scores 0.88–0.94. The gap to the
+    bound is the better yardstick here, as on the train env.
+
 ## Backlog
 
 - New cores from [applications.md](applications.md), in the recommended
   order:
-  - runway sequencing (sequence-dependent separation times; exact bound,
-    constrained position shifting as the rule);
   - electric bus charging (a charge state and charger resources, on `bus`
     or `fleet`);
   - lock scheduling (a batch server with packing and a direction setup);
@@ -1030,6 +1148,12 @@ worked on routes over blocks.
   (mine haul roads).
 - Paper references: check and complete the references in
   applications.md (cited from memory) and add them to related-work.md.
+  Include the runway env's: the separation matrix (Balakrishnan and
+  Chandran 2010), Beasley et al. 2000, Dear 1976 and Psaraftis 1980.
+- Runway: a rolling-horizon exact planner (the DP on the aircraft known
+  at each tick) as the look-ahead baseline; departures and mixed-mode
+  operations; several runways; ETA uncertainty; a latest landing time;
+  passenger weights per class; PPO on `runway/*` (short runs first).
 - When the backlog runs low, revisit [applications.md](applications.md):
   assess more applications and pick the next new core from it.
 

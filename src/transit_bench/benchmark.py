@@ -63,6 +63,10 @@ def baselines(env_id, env):
 
         out["no termination"] = NoTermination(env)
         out["bus-blind terminate"] = BusBlind(env)
+    if family == "runway":
+        from transit_bench.envs.runway.heuristic import FirstComeFirstServed
+
+        out["first come first served"] = FirstComeFirstServed(env)
     out["heuristic"] = env.heuristic()
     return out
 
@@ -118,6 +122,14 @@ def domain_metrics(env_id, env, rewards, info):
             ("terminated/ep", f"{info['terminated'].sum(axis=0).mean():.2f}"),
             ("transferred/ep", f"{info['transferred'].sum(axis=0).mean():.1f}"),
             ("bunching", f"{info['bunched'].sum() / n:.3f}"),
+        ]
+    if family == "runway":
+        due = max(info["due"].sum(), 1)
+        delay = info["waiting"].sum() * env.config.step_seconds / 60 / due
+        return [
+            ("delay/aircraft", f"{delay:.2f} min"),
+            ("landed/ep", f"{info['landed'].sum(axis=0).mean():.1f}"),
+            ("rejected/ep", f"{info['rejected'].sum(axis=0).mean():.2f}"),
         ]
     return []
 

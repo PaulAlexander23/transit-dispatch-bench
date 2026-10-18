@@ -34,6 +34,7 @@ new one. The maths of the existing models is in
 | Job shop with blocking | `train` | Ordering decisions at shared capacity-1 resources; deadlock as a cycle; route choice; stopping (terminate) |
 | Dynamic matching and repositioning | `fleet` | Assignment each tick, and moving idle vehicles ahead of demand |
 | Coupled modes | `corridor` | One mode's decision (ending a trip) sets the other's demand |
+| Sequence-dependent setups | `runway` | A service's duration depends on the one before it |
 | Disruptions (shared by all) | `core.disruption` | Markov, semi-Markov or scripted outages of edges and vehicles |
 
 ## How general the train model is
@@ -75,7 +76,7 @@ it adds (if any) and a verdict:
 | High-frequency metro | `bus` holding + `train` blocking | Headway control without overtaking | note |
 | Several lift cars in one shaft | `elevator` | Fixed vehicle order on a shared track | extend |
 | Airport taxiing | `train` + route graphs | None beyond route graphs | note |
-| Runway sequencing | (none) | Sequence-dependent separation times | new |
+| Runway sequencing | `runway` (built, Phase 9) | Sequence-dependent separation times | new |
 | Airline disruption recovery | `train` TERMINATE + circulation (backlog) | Chains of trips per vehicle and crew | note |
 | Air traffic flow management | `train` | Capacity above 1: cumulative constraints, flow over time | new |
 | Depot shunting, container stacking | (none) | Last-in, first-out storage | new |
@@ -176,6 +177,12 @@ train went before. **New**. It is small and crisp, with strong bounds: an
 exact MILP or DP for short horizons, and constrained position shifting
 (each aircraft at most k places from first come, first served) as the
 classical rule.
+
+Built as `runway/*` (Phase 9 of the plan). The bound turned out to be an
+exact DP rather than a MILP: grouping the aircraft by class shrinks the
+state to the counts landed per class, with a Pareto front per state for
+the release times. On 36 aircraft an hour, FCFS is 30% above the bound
+and constrained position shifting (k = 2) 19%.
 
 ### Airline disruption recovery
 
