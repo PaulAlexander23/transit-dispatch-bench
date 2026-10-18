@@ -30,7 +30,9 @@ from transit_bench.envs.train.heuristic import (
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
-        "--presets", nargs="+", default=["line", "passing", "single", "blockage", "junction"]
+        "--presets",
+        nargs="+",
+        default=["line", "passing", "single", "blockage", "junction", "branch", "branch_outage"],
     )
     parser.add_argument("--episodes", type=int, default=200)
     parser.add_argument("--max-steps", type=int, default=720)

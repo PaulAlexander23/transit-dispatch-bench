@@ -10,7 +10,7 @@ heuristic, and a normalised score (random = 0, heuristic = 1).
 |---|---|---|---|
 | `elevator/*` | Line of floors | Move or serve, per lift | Collective control |
 | `bus/*` | Loop of stops | Go or hold, per deciding bus | Headway-based holding |
-| `train/*` | Blocks of track, double or single | Go or wait (or terminate, or divert), per deciding train | Route setting, giving way to expresses, rerouting |
+| `train/*` | Blocks of track, double or single, on a line or any network | Go or wait (or terminate, or divert), per deciding train | Route setting, giving way to expresses, rerouting |
 | `fleet/*` | Grid of nodes | Stay, move, or take a waiting request, per idle vehicle | Per-tick matching (exact auction) with rebalancing |
 | `corridor/*` | A single-track line and a bus loop along it | Train actions (incl. terminate) and bus go/hold, in one state | Terminate when stuck, at a cost read from the buses; headway holding |
 
@@ -19,7 +19,9 @@ core process (as are vehicle breakdowns, on `bus/breakdown-v0` and
 `elevator/outage-v0`);
 `bus/closure-v0` and `train/blockage-v0` switch them on, and `train/response-v0`
 adds a TERMINATE action (cancel or short-turn a train, at a cost per missed
-call). `train/junction-v0` adds route choice: relief tracks alongside two
+call). `train/branch-v0` runs on a network rather than a line (a trunk
+splitting into two branches; any network can be given as a `Network`).
+`train/junction-v0` adds route choice: relief tracks alongside two
 sections, and a DIVERT action to take them. `train/bridge-v0` adds
 replacement buses: BRIDGE ends a trip and sends a bus to serve its calls.
 `corridor/*` couples the train and bus envs in one state. A terminated

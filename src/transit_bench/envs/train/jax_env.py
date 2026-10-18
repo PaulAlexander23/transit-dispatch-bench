@@ -274,6 +274,18 @@ class TrainEnv:
         on_platform = station_of[jnp.maximum(self.here(state), 0)] >= 0
         return self.ready(state) & (self.next_block(state) >= 0) & (~started | on_platform)
 
+    def heading_now(self, state, j):
+        """Elementwise over trains j: the heading in the block each holds."""
+        heading = jnp.asarray(self.infra.heading, jnp.int32)
+        L = heading.shape[1]
+        return heading[j, jnp.clip(state.pos[j], 0, L - 1)]
+
+    def entry_heading(self, state):
+        """(trains,) the heading each would enter its next block with."""
+        heading = jnp.asarray(self.infra.heading, jnp.int32)
+        L = heading.shape[1]
+        return heading[jnp.arange(self.n_trains), jnp.clip(state.pos + 1, 0, L - 1)]
+
     def here(self, state):
         """(trains,) the block each train holds, or -1."""
         route = self.route_now(state)
@@ -509,23 +521,25 @@ class TrainEnv:
         it before and after this one."""
         infra = self.infra
         S, T = self.n_sections, self.n_trains
-        direction = jnp.asarray(infra.direction, jnp.int32)
         section_of = jnp.asarray(infra.section_of, jnp.int32)
         next_section = jnp.asarray(infra.next_section, jnp.int32)
         index = jnp.minimum(state.pos + 1, next_section.shape[1] - 1)
-        target = jnp.where(self.finished(state), -1, next_section[jnp.arange(T), index])
+        rows_t = jnp.arange(T)
+        target = jnp.where(self.finished(state), -1, next_section[rows_t, index])
+        d = jnp.asarray(infra.next_heading, jnp.int32)[rows_t, index]
         holder = state.occupant
         in_section = (holder >= 0) & (section_of >= 0)
         rows = jnp.where(in_section, section_of, S)
-        cols = direction[jnp.maximum(holder, 0)]
+        cols = self.heading_now(state, jnp.maximum(holder, 0))
         occupied = jnp.zeros((S + 1, 2), bool).at[rows, cols].max(in_section)
         safe = jnp.where(target >= 0, target, S)
-        inside = occupied[safe, 1 - direction] & (target >= 0)
+        inside = occupied[safe, 1 - d] & (target >= 0)
         joining = self.joining(state)
+        entry = self.entry_heading(state)
         rival = (
             (joining[None, :] == target[:, None])
             & (target[:, None] >= 0)
-            & (direction[None, :] != direction[:, None])
+            & (entry[None, :] != d[:, None])
         )  # [i, j]: j is an oncoming train joining i's next section
         order = jnp.arange(T)
         before = (rival & (order[None, :] < order[:, None])).any(axis=1)
@@ -570,7 +584,9 @@ class TrainEnv:
         b = route[trains, jnp.clip(p, 0, route.shape[1] - 1)]
         j = state.occupant[b]
         occupied = on_route & (j >= 0)
-        same = occupied & (direction[jnp.maximum(j, 0)] == direction[:, None])
+        heading = jnp.asarray(self.infra.heading, jnp.int32)
+        mine = heading[trains, jnp.clip(p, 0, heading.shape[1] - 1)]
+        same = occupied & (self.heading_now(state, jnp.maximum(j, 0)) == mine)
         is_open = on_route & state.blocks.open[b]
         d = state.disruption
         down = on_route & d.down[b]

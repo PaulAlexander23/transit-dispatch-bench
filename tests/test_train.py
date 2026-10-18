@@ -11,7 +11,7 @@ from transit_bench import make
 from transit_bench.core.policy import RandomPolicy, make_rollout
 from transit_bench.envs.train import PRESETS, TrainConfig, TrainEnv
 from transit_bench.envs.train.heuristic import FirstComeFirstServed, SectionReservation
-from transit_bench.envs.train.infra import EAST, WEST, build
+from transit_bench.envs.train.infra import EAST, WEST, Network, build
 from transit_bench.envs.train.sim import (
     BRIDGE,
     DIVERT,
@@ -36,6 +36,27 @@ def x64():
     jax.config.update("jax_enable_x64", True)
     yield
     jax.config.update("jax_enable_x64", False)
+
+
+# A small network with routes of different lengths, a spur and both kinds
+# of track, blockages and TERMINATE: what the line presets don't exercise.
+MIXED = replace(
+    PRESETS["line"],
+    n_stations=5,
+    terminate_penalty=5.0,
+    disruption=PRESETS["blockage"].disruption,
+    network=Network(
+        5,
+        edges=((0, 1, False), (1, 2, True), (2, 3, True), (2, 4, False)),
+        services=(
+            ((0, 1, 2, 3), 2, 900.0, 0.0),
+            ((3, 2, 1, 0), 2, 900.0, 0.0),
+            ((1, 2, 4), 3, 600.0, 100.0),
+            ((4, 2, 1), 2, 600.0, 400.0),
+        ),
+    ),
+)
+CASES = {**PRESETS, "mixed": MIXED}
 
 
 def calm(sim):
@@ -221,8 +242,9 @@ def replay(preset, policy, seed):
 
 
 @pytest.mark.usefixtures("x64")
-@pytest.mark.parametrize("preset", PRESETS)
+@pytest.mark.parametrize("preset", CASES)
 def test_jax_matches_python_step_for_step(preset):
+    preset = CASES[preset]
     for seed in range(2):
         # Five actions everywhere: TERMINATE without a terminate_penalty,
         # DIVERT away from a junction and BRIDGE without buses hold as WAIT does.
@@ -236,10 +258,11 @@ def test_jax_matches_python_step_for_step(preset):
 
 
 @pytest.mark.usefixtures("x64")
-@pytest.mark.parametrize("preset", PRESETS)
+@pytest.mark.parametrize("preset", CASES)
 def test_jax_heuristics_match_python(preset):
     from transit_bench.envs.train.heuristic import GiveWayToExpress, Reroute, RouteSetting
 
+    preset = CASES[preset]
     env = TrainEnv(preset)
     for policy, reference in [
         (env.heuristic(), heuristic),
@@ -325,6 +348,63 @@ def test_rollout_and_mappo_run():
 def test_config_validation():
     with pytest.raises(ValueError):
         TrainConfig(single_track=True, passing_loops=True)
+    net = Network(3, edges=((0, 1, True), (1, 2, True)), services=(((0, 1, 2), 1, 600.0, 0.0),))
+    with pytest.raises(ValueError, match="n_stations"):
+        TrainConfig(network=net)
+    with pytest.raises(ValueError, match="line options"):
+        TrainConfig(n_stations=3, network=net, single_track=True)
+    with pytest.raises(ValueError, match="missing edge"):
+        Network(3, edges=((0, 1, True),), services=(((0, 1, 2), 1, 600.0, 0.0),))
+    with pytest.raises(ValueError, match="duplicate"):
+        Network(3, edges=((0, 1, True), (1, 0, False)), services=())
+
+
+# -- networks ------------------------------------------------------------------
+
+
+def test_a_network_builds_each_service_route_with_its_own_length():
+    infra = build(MIXED)
+    assert MIXED.n_trains == len(infra.route) == 9
+    lengths = sorted(set(infra.route_len.tolist()))
+    assert lengths == [7, 10]  # 3 stations + 2 sections, 4 stations + 3 sections
+    for i in range(len(infra.route)):
+        n = infra.route_len[i]
+        assert (infra.route[i, :n] >= 0).all() and (infra.route[i, n:] == -1).all()
+        assert infra.calls_from[i, 0] == (n + 2) // 3  # every station is a call
+        stations = infra.station_of[infra.route[i, :n]]
+        assert (stations[::3] >= 0).all()  # platform, 2 section blocks, platform, ...
+
+
+def test_headings_follow_each_section_and_pick_the_platform():
+    infra = build(MIXED)
+    for i in range(len(infra.route)):
+        n = infra.route_len[i]
+        stations = [s for s in infra.station_of[infra.route[i, :n]] if s >= 0]
+        for p in range(n):
+            q = 3 * min(p // 3, len(stations) - 2)  # the section's starting platform
+            a, b = stations[q // 3], stations[q // 3 + 1]
+            assert infra.heading[i, p] == (0 if b > a else 1)
+    # Single-track sections are shared by both headings, double-track ones not.
+    shared = {
+        int(infra.section_of[b]): bool(infra.section_shared[infra.section_of[b]])
+        for b in range(infra.n_blocks)
+        if infra.section_of[b] >= 0
+    }
+    assert sorted(shared.values()).count(True) == 2  # (1, 2) and (2, 3)
+
+
+def test_opposing_trains_cross_at_a_station_on_a_network():
+    """On the single-track (1, 2), (2, 3) stretch the two-way services meet;
+    route setting runs them all to the end without deadlock."""
+    sim = TrainSim(replace(MIXED, disruption=PRESETS["line"].disruption), max_steps=720)
+    sim.reset(0)
+    exo = calm(sim)
+    for _ in range(sim.max_steps):
+        _, _, terminated, _, info = sim.step(route_setting(sim), exo)
+        assert info["deadlocked"] == 0
+        if terminated:
+            break
+    assert all(sim.finished(i) for i in range(len(sim.pos)))
 
 
 def test_observation_shows_an_oncoming_rival_for_the_section():

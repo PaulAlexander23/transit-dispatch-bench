@@ -92,6 +92,13 @@ arc, and each disjunction a pair of alternative arcs. A schedule chooses one
 arc per pair; it is feasible if the chosen graph has no positive-length cycle,
 and a **deadlock is such a cycle**.
 
+Nothing here needs a line: the model is routes over blocks. On a general
+network (`infra.Network`), "a train going the other way" on a shared
+section means a train traversing it with the other *heading* (from its
+higher- to its lower-numbered station, or back). The env's conflict
+rules and observation use headings per route position, which on a line
+are the trains' directions.
+
 So the natural RL action is **one ordering choice at a conflict: which train
 goes first into a contested block**. This is a small discrete action with a
 clear meaning, and matches what a dispatcher actually decides.

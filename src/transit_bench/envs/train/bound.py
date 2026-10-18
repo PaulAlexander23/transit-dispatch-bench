@@ -135,7 +135,8 @@ def solve(env, scen, time_limit=30.0, horizon=None):
     # where[i][b] = (p, unused): train i is at route position p in block b,
     # and `unused` is 0 if it always uses b, else the expression that is 1
     # when it does not (it took the other track).
-    where = [{int(b): (p, 0) for p, b in enumerate(infra.route[i])} for i in range(T)]
+    n = [int(x) for x in infra.route_len]  # route lengths (routes are padded with -1)
+    where = [{int(b): (p, 0) for p, b in enumerate(infra.route[i, : n[i]])} for i in range(T)]
     ticks = [[int(d[i, p]) for p in range(L)] for i in range(T)]
     section_of = infra.section_of
     for i in range(T):
@@ -149,13 +150,13 @@ def solve(env, scen, time_limit=30.0, horizon=None):
             where[i][alt] = (p, 1 - z[s])
             ticks[i][p] = int(d[i, p]) + (int(d_relief[i, p]) - int(d[i, p])) * z[s]
     for i in range(T):
-        for p in range(L - 1):
+        for p in range(n[i] - 1):
             h.addConstr(x[i][p + 1] - x[i][p] >= ticks[i][p])
-        h.addConstr(a[i] - x[i][L - 1] >= ticks[i][L - 1])
-        h.addConstr(late[i] - dt * a[i] >= -float(infra.sched[i, L]))
+        h.addConstr(a[i] - x[i][n[i] - 1] >= ticks[i][n[i] - 1])
+        h.addConstr(late[i] - dt * a[i] >= -float(infra.sched[i, n[i]]))
 
     def leave(i, p):
-        return x[i][p + 1] if p + 1 < L else a[i]
+        return x[i][p + 1] if p + 1 < n[i] else a[i]
 
     def relax(unused):
         """M when the train does not use the block, else 0 (as an expression)."""
@@ -192,6 +193,7 @@ def solve(env, scen, time_limit=30.0, horizon=None):
     found = info.primal_solution_status == 2  # a feasible solution exists
     values = np.asarray(h.getSolution().col_value) if found else np.full(T * L + T, np.nan)
     entry = np.rint(values[: T * L]).reshape(T, L)  # x was added first, row by row
+    entry[np.arange(L)[None, :] >= np.asarray(n)[:, None]] = np.nan  # past each route
     arrival = np.rint(values[T * L : T * L + T])
     return Bound(float(value) / 60, bool(optimal), float(h.getRunTime()), entry, arrival)
 
