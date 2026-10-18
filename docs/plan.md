@@ -266,7 +266,9 @@ block first. Presets, one hard feature at a time:
 - [x] `passing`: passing loops, mixed fast and slow trains (overtaking).
 - [x] `single`: single track with crossing points; deadlock becomes possible.
       Detect it in JAX by repeated squaring of the wait-for matrix.
-- [ ] `junction`: a small network with route choice.
+- [x] `junction`: a small network with route choice. Done as relief
+      tracks: a second, slower track alongside a section, and a DIVERT
+      action at the station before it (Result below).
 - [x] Heuristics: keep to timetable with first-come-first-served at
       conflicts; prioritised replanning (the Flatland 2020 winners' approach),
       so RL is compared with a planner, not only a rule.
@@ -421,23 +423,87 @@ optimal and copies section reservation, but does not yet improve on it.
   see a late express or a long dwell coming, and some of it is the value
   of information. This is the headroom a learner or a stochastic
   look-ahead could go after on `passing`.
+- **Route choice: relief tracks and DIVERT** (`TrainConfig.relief_sections`,
+  `train/junction-v0`). A full graph with arbitrary alternative routes
+  would change every per-train table (routes, timetable, calls, the
+  bound's variables) into a per-route one. A *relief track* keeps them
+  all: a second track alongside a section, with the same number of
+  blocks, `relief_slowdown` (1.25) times slower, used in both directions.
+  A train's route positions line up whichever track it takes, so the
+  timetable, its calls, the trip's noise (per position) and the platforms
+  are unchanged; only the block and its running time at those positions
+  differ (`Infra.alt_route`, `alt_run`). The state gains a (trains, L)
+  flag, on the relief track at each position.
+  - **DIVERT** (action 3; the action space is 4 wherever there is a relief
+    track) is legal *at a junction*, i.e. on the platform before such a
+    section: the train enters the relief track's first block and follows
+    it to the end of the section. A train at a junction is deciding if
+    either first block is free and open, and blocked if the one it chose
+    is not. Observation: two more head fields (at a junction; the relief
+    block is free and open), so `HEAD_FIELDS` is now 17 on every preset.
+  - **Deadlock detection becomes approximate there.** With two ways out,
+    the wait-for relation is an AND-OR graph: a train at a junction is
+    stuck only if both next blocks' holders are. Squaring the wait-for
+    matrix handles single successors only, so a train whose relief block
+    is free counts as waiting for no one, and one whose relief block is
+    taken counts as waiting for the main block's holder only. So a policy
+    that ignores the relief track can sit in a "deadlock" the metric does
+    not report (section reservation on `junction`: 0 deadlocks, but delay
+    as on `blockage`).
+  - **`junction` preset**: `blockage` plus relief tracks alongside the two
+    middle sections. The relief blocks are numbered after all the others
+    and closures are drawn per block in one vector, so the main blocks'
+    closures are the same as `blockage`'s for a seed: route setting, which
+    never diverts, scores the same on both (2.96 vs 3.01 min per train).
+  - **Rule: `Reroute`** (the `junction` heuristic): route setting, plus at
+    a junction, if the main track's next block is taken or any of the
+    section's main blocks is closed, divert when the relief track is free,
+    open throughout, has no oncoming train in it (or diverting into it
+    ahead in the acting order), and the platform at its far end is free
+    (route setting for the relief track, which carries both directions).
+  - **Hindsight bound with route choice.** One more binary per train and
+    relief section; times in those blocks are `d + (d_relief − d) z`, and
+    each blocking and closure constraint on a block is relaxed by M for a
+    train that does not use it. Still below every finished episode
+    (tested on `junction`), 99% solved to optimality, 0.8 s on average.
+  - **Results** (harness, 512 episodes; `scripts/bound_eval.py`, 200
+    scenarios; minutes per train):
+
+    | Policy on `junction` | Delay | CVaR10 | Above bound |
+    |---|---|---|---|
+    | Route setting (never diverts) | 3.01 | 15.4 | 34% |
+    | **Reroute** | **1.75** | **7.05** | **10%** |
+    | Hindsight bound | | | (1.87 vs reroute's 2.09 on its scenarios) |
+
+    Diverting 1.5 times an episode cuts the mean by 42% and halves the
+    tail. Most of that is going around closures: on the calm
+    single-track line with the same relief tracks (1,024 episodes) reroute
+    gains only 1.16 → 0.98 min per train (0.9 diversions an episode, to
+    cross or pass a train), against 2.93 → 1.75 with closures.
+  - **What was learned.** Reroute is a greedy rule, yet it is within 10%
+    of the hindsight optimum, closer than any rule on the other
+    disruption presets. The remaining gap is the trade it never makes:
+    waiting for a main block that will clear soon instead of taking the
+    25% slower track, and diverting a train early to leave the main track
+    to a later one.
 ### Phase 4: disruptions
 
 - [x] Core disruption process: edge outages (`κ_e = 0`), slow running
       (`σ_e > 1`), vehicle failures, demand surges. Markov, semi-Markov
       (lognormal durations, elapsed time observed) and scripted modes.
-      Done for edge outages and slow running (`core/disruption.py`);
-      vehicle failures and demand surges are still to do.
+      Done for edge outages and slow running (`core/disruption.py`), and
+      vehicle failures by running the same process over vehicles (bus
+      breakdowns, lift outages). Demand surges are still to do.
 - [x] Observation switch: remaining outage time visible or hidden.
 - [x] Train `blockage` preset with short-turn, cancel and reroute actions.
       Done: `blockage` (random closures on the single-track line) and
       `response` (longer closures plus TERMINATE, which cancels a trip
-      before departure or short-turns it at a platform). Reroute needs
-      route choice, so it comes with the `junction` preset (Phase 3); the
-      return half of a short-turn needs vehicle circulation (backlog).
-- [ ] Switch disruptions on for elevator (car out of service) and bus
-      (road closure, breakdown). The bus env already holds buses at a
-      closed edge; it is not yet wired to the process.
+      before departure or short-turns it at a platform), and `junction`
+      (reroute onto a relief track with DIVERT, Phase 3). The return half
+      of a short-turn needs vehicle circulation (backlog).
+- [x] Switch disruptions on for elevator (car out of service) and bus
+      (road closure, breakdown). Done: `bus/closure-v0`,
+      `bus/breakdown-v0` and `elevator/outage-v0` (Result below).
 - [x] Evaluation: in-distribution, shift (trained without, tested with),
       and CVaR at 10% of delay alongside the mean.
 
@@ -557,19 +623,136 @@ them so far is a better rule, not RL.
     Starting from a clone keeps the rule's behaviour (the shield keeps
     GO/WAIT safe, so fine-tuning no longer erodes it), but 5M steps found
     no improvement.
+- **Bus road closures** (`BusConfig.disruption`, `bus/closure-v0`). The
+  bus env now runs the core process on its edges, as the train env does
+  on blocks: it advances at the end of each tick, a closed edge holds
+  buses at the stop before it, and a slowed one (speed > 1) stretches the
+  running time drawn on departure. The disruption draws use a key folded
+  from the step's key, so the arrival and noise draws of the other
+  presets are unchanged (their rows in the results table are identical).
+  Observation: per stop, the edge out of it is down, time since, and
+  time left if observable (`STOP_FIELDS` 3 → 6 on every bus preset).
+  JAX matches Python step for step on all presets. `closure` is `peak`
+  plus Markov closures, 0.1 per edge-hour, 5 minutes on average (about
+  one an episode). Harness, 512 episodes:
+
+  | Policy | `peak` return / wait / headway CV | `closure` |
+  |---|---|---|
+  | Always go | −1582 / 347 s / 0.83 | −1617 / 368 s / 0.87 |
+  | Headway holding | −1540 / 288 s / 0.46 | −1595 / 323 s / 0.52 |
+
+  A closure costs headway holding 55 return and 35 s of mean wait, and
+  its lead over always-go halves (42 → 22). A queue that forms behind a
+  closure leaves bunched; the rule re-spaces it at the next stops, but
+  only 120 s per stop (`max_hold_seconds`), and nothing in it
+  anticipates the closure (e.g. holding buses upstream while the road is
+  shut, so they do not all join the queue). That is headroom for a
+  closure-aware rule or a learner.
+- **Bus breakdowns** (`BusConfig.breakdown`, `bus/breakdown-v0`). Vehicle
+  failures reuse the core process with buses in place of edges: a bus
+  goes down at random and is repaired after a random time; while down it
+  freezes (no running, boarding, alighting or departing) and is not
+  deciding. Observation: three more head fields per bus (broken down,
+  for how long, time to repair if observable), so `HEAD_FIELDS` 7 → 10.
+  `breakdown` is `peak` with 0.3 failures per bus-hour, 5 minutes on
+  average (about one an episode). Holding −1619 vs always-go −1633
+  (512 episodes): the rule's lead falls from 42 on `peak` to 13. Variants
+  that re-space for the buses still running (target headway × B / (B −
+  broken)), stop holding during a breakdown, or allow longer holds are
+  all within noise of it (1,024 episodes, ±4.5): with 3 buses a failure
+  removes a third of the capacity, and no holding rule recovers that.
+  The levers that would are out of this env's action space (a spare bus,
+  short-turning the bus behind).
+- **Lift cars out of service** (`ElevatorConfig.failure`,
+  `elevator/outage-v0`). The same vehicle-failure use of the process: an
+  out-of-service car ignores its actions, finishes any move or door cycle
+  under way, and stands with its passengers until it is back. The
+  observation gains one entry per lift (out of service) *only* when the
+  config has failures, and the failure draws use a key folded from the
+  step's, so the other presets' observations and draws are unchanged and
+  the port still matches the old repo exactly. JAX matches Python step
+  for step, including a test where every car fails and recovers within
+  80 steps. `outage` is `full` with 3 failures per car-hour lasting a
+  minute on average (about 0.7 in a 200 s episode across 4 cars).
+  Collective control delivers 65.8 vs 67.1 on `full` (512 episodes): it
+  does not coordinate the cars, so nothing is assigned to a dead car and
+  the other three pick up its calls. Small at this rate; longer episodes
+  or rarer, longer outages would weigh more.
 ### Phase 5: on-demand fleet
 
-- [ ] Env: grid graph, requests with OD, vehicle assignment + repositioning.
-- [ ] Heuristics: nearest idle vehicle; per-tick bipartite matching.
+- [x] Env: grid graph, requests with OD, vehicle assignment + repositioning.
+- [x] Heuristics: nearest idle vehicle; per-tick bipartite matching.
+
+**Result.** `envs/fleet/`: a Python reference and a JAX env that match step
+for step (all state is integer, so exactly), three presets, and three
+rules, the strongest a third better than nearest idle.
+
+- **Model.** Nodes of a G × G grid, one edge per tick (60 s), Manhattan
+  travel (x first, then y). Requests arrive as a Poisson process with an
+  origin and destination into a buffer of R slots (full: rejected), and
+  abandon after `patience` ticks (8) unless taken. Each vehicle carries
+  one request. An idle vehicle is the deciding agent: STAY, MOVE one node
+  (repositioning), or TAKE request slot r (5 + r actions in all); then it
+  drives itself to the pickup and on to the dropoff. Vehicles act in
+  index order, so a request two vehicles take goes to the earlier one.
+  Reward: minus waiting passenger-minutes, and 10 minutes per abandoned or
+  rejected request. Observation per vehicle: its position and job; per
+  request slot, the offset to the origin, pickup and trip distances and
+  time waited; per node, other idle vehicles and waiting requests.
+- **Action design.** "Take slot r" keeps the action space fixed (5 + R)
+  and lets every rule be written as a policy over it: nearest idle and
+  matching choose slots, repositioning chooses moves. The cost is that a
+  learner must learn which slot is which from the slot features; a
+  pointer-style policy over requests would be the natural next step.
+- **Matching, exactly, in integers.** The matching rule is a minimum-cost
+  assignment of idle vehicles to waiting requests (pickup distance), with
+  V + 1 dummy "stay" objects costing more than any distance so it serves
+  as many as it can. Solved by Bertsekas' auction algorithm: benefits
+  −cost × (n + 1) for n bidders and price increments of at least 1 make
+  it exactly optimal (tested against brute force on random instances),
+  and integer arithmetic makes the JAX `while_loop` version match the
+  Python one bit for bit. A Hungarian solver would not vectorise.
+- **Rebalancing.** Each vehicle gets a home, the origin-weight quantile
+  (v + ½)/V, and an idle vehicle that matching leaves alone heads home.
+  The env heuristic is matching + rebalancing.
+- **Presets and results** (harness, 512 episodes; return, lost share,
+  mean wait):
+
+  | Preset | Nearest idle | Matching | Matching + rebalancing |
+  |---|---|---|---|
+  | `grid` (5×5, 4 vehicles, 0.5/tick, uniform) | −395 / 2.2% / 3.0 min | −293 / 2.1% / 2.1 | **−286** / 2.0% / 2.1 |
+  | `commute` (trips west → east) | −517 / 4.0% / 3.8 | −391 / 3.9% / 2.7 | **−331** / 3.1% / 2.3 |
+  | `city` (8×8, 10 vehicles, 1.2/tick, commute) | −3005 / 22% / 8.6 | −1758 / 14% / 4.3 | **−1709** / 13% / 4.2 |
+
+- **What was learned.**
+  - Matching beats nearest idle by 25–40% on every preset, most on the
+    overloaded `city` (lost requests 22% → 14%). The likely cause (not
+    yet measured): serving the longest-waiting request first sends a
+    vehicle across the grid while requests next to it wait, and greedy
+    choices cannot be undone within the tick. This is the formulation's point that the per-tick
+    assignment is a much stronger baseline than nearest idle.
+  - Rebalancing matters where demand is asymmetric: 15% on `commute`
+    (vehicles end trips in the east and must come back empty), 3% on
+    `grid` and `city`. On `city` the fleet is too busy to rebalance: few
+    vehicles are ever idle with nothing to take.
+  - Where RL should look: anticipatory repositioning (going where
+    requests will appear, not where they started on average), and
+    holding a vehicle back from a far request for a likely near one,
+    which per-tick matching never does.
 
 ### Phase 6: benchmark harness
 
 - [x] One command runs random, heuristic and PPO on every env/preset over
       seeds and writes a results table (normalised scores + domain metrics),
       like the old repo's `benchmark.py --readme`. Done for the baselines:
-      `python -m transit_bench.benchmark --write docs/results.md`; PPO rows
-      come from the per-env scripts for now (`reproduce_elevator.py`,
-      `bus_baselines.py`, `train_baselines.py`, `disruption_eval.py`).
+      `python -m transit_bench.benchmark --write docs/results.md`. PPO
+      rows: `--ppo-timesteps N` trains MAPPO (PPO where the observation is
+      not per agent) on each env with one shared config and adds its
+      greedy policy's row (`algos.ppo.Greedy`, now in the library). Not
+      yet run for the table: 24 envs at a few million steps each is a long
+      run, to be agreed first. Until then PPO numbers come from the
+      per-env scripts (`reproduce_elevator.py`, `bus_baselines.py`,
+      `train_baselines.py`, `disruption_eval.py`, `response_eval.py`).
 
 **Result.** [results.md](results.md): 14 envs × 2–4 baselines × 512
 episodes in about 2 minutes on the GTX 1080. Running every rule on every
@@ -585,11 +768,181 @@ designed for.
 
 ### Phase 7: coupled modes (stretch)
 
-- [ ] Bus bridging: when a rail block closes, buses run a replacement
+- [x] Bus bridging: when a rail block closes, buses run a replacement
       service between the affected stations. Train and bus envs share one
       core state. No paper found does short-turning and bridging jointly.
+      Done as a first step: buses as a shared resource inside the train
+      env (`bridge_buses`, BRIDGE, `train/bridge-v0`), not a coupling of
+      the two envs' states (Result below).
+
+**Result.** Short-turning and bridging decided jointly, by one rule, on one
+line; bridging pays when missed calls are dear.
+
+- **Model.** A pool of replacement buses waits at the depot (the middle
+  station). BRIDGE ends a trip as TERMINATE does and sends the
+  lowest-numbered free bus: it drives from the depot to where the train
+  stopped (its origin, for a cancellation), then through the train's
+  remaining calls on a road alongside the line, `bus_slowdown` (1.5)
+  times slower than a stopping train, dwelling at each. Each call costs
+  the bus's lateness there against the train's timetable, capped at the
+  missed-call penalty, and the bus is busy until it is back at the
+  depot. Bus travel has no noise, so a bridge's cost and the bus's return
+  are known when it is sent (`bridge_plan`). Observation: can bridge,
+  and the bridge's cost (`HEAD_FIELDS` 17 → 19). JAX matches Python step
+  for step under random five-action play and the rule.
+- **Why not couple the bus env.** The bus env is a loop of stops with
+  passengers and headway holding; a replacement service is a shuttle
+  along the rail line, timed against the train timetable. Sharing one
+  core state between the two envs would mean a common clock, passenger
+  model and network, which is the real Phase 7 design question; the
+  resource model gets the decision (when to end a trip, with or without
+  a bus) without it.
+- **Rule.** `TerminateWhenStuck` now ends a trip the cheaper way: BRIDGE
+  if a bus is free and bridging costs less than the penalty, else
+  TERMINATE; free buses go to trains in index order, and the stopping
+  threshold uses the cheaper cost.
+- **Results** (2,048 episodes, seed 7; cost per train in minutes; the
+  same scenarios for every row, since only the bus pool differs):
+
+  | Policy | Penalty 5 min/call | Penalty 15 (`bridge`) |
+  |---|---|---|
+  | Route setting | 4.98 / CVaR 25.8 | 4.98 / 25.8 |
+  | Terminate, no buses | 3.52 / 15.6 | 4.67 / 22.5 |
+  | Terminate + 1 bus | 3.44 / 15.3 | 4.01 / 19.2 |
+  | **Terminate + 2 buses** | 3.40 / 15.1 | **3.75 / 17.8** |
+  | Terminate + 4 buses | 3.39 / 15.0 | 3.67 / 17.2 |
+
+- **What was learned.**
+  - Where a missed call is dear (a 30-minute headway), terminating alone
+    barely helps (4.98 → 4.67): the penalty outweighs most waits. Two
+    buses make it 20% better (3.75) and terminate more often (0.40 →
+    0.53 trains per episode), because a bridged call costs
+    the bus's lateness, not the full penalty: buses change *when* to
+    short-turn, not just what it costs. That is the joint decision.
+  - Returns diminish fast: the first bus saves 0.66 min per train, the
+    second 0.26, the third and fourth 0.08 between them. Presumably
+    because outages rarely overlap on one line (not measured).
+  - At a 5-minute penalty buses add little (3.52 → 3.40): the cap means a
+    bridged call can save at most 5 minutes, and a bus that has to come
+    from the depot is often later than that.
+
+- [x] Coupled corridor (`corridor/*`): the train line and a bus route
+      along it in one state, with one clock, one network and one
+      passenger model. A short-turned train's riders move to the bus.
+
+**Design.** The three things the two envs have to share, and the choice
+made for each:
+
+- **Clock.** One tick for both (`step_seconds` must agree). Within a tick,
+  the trains act first, then stranded riders join the bus stops, then the
+  buses act. So a bus at that stop can board them in the same tick.
+- **Network.** The bus route is built from the rail line: a loop of
+  2(n − 1) stops, out along the stations and back. Stop s is station s
+  eastbound, and stop 2(n − 1) − s is station s westbound (the two end
+  stations are shared). Each bus edge takes the road time of one section
+  (`bus_slowdown` x the stopping train's running time, as for bridging).
+  Rail blockages and road closures stay independent processes: a
+  correlated one (one flood closing both) is a backlog item.
+- **Passengers.** Each train leaves its origin with `riders_per_call`
+  riders for each later call. That is the simplest rail model with a
+  destination per rider, which is what a transfer needs. While a train
+  runs, every rider still on board pays its projected lateness: weight
+  r x (calls left) on the change in the train's projected delay each
+  tick. Summed, a rider's cost is about the train's lateness at their
+  stop. If the train terminates, its riders get off at that station (or
+  never left the origin). They join the bus stop for that station in the
+  train's direction, each with the bus stop of their own call as
+  destination. From then on they are ordinary bus passengers and pay bus
+  passenger-minutes (waiting and riding). This replaces the train env's
+  fixed missed-call penalty with a cost the bus state decides.
+- **Common units.** The reward is minus passenger-minutes over everyone.
+  For rail riders that means lateness; for bus riders, all their time.
+  To put transferred riders on the lateness scale, each one earns a
+  credit of 1 minute per minute from the transfer until its scheduled
+  arrival plus the lateness already charged (`credit_end`). Over an
+  episode a transferred rider then costs its bus arrival minus its
+  scheduled train arrival. The credit is paid per tick rather than all
+  at once: a lump at the transfer would make terminating look good
+  straight away, followed by a slow bill (a credit-assignment trap for
+  RL). Paid per tick, the reward comes to zero while the bus keeps them
+  on time.
+- **Agents.** The trains and then the buses, with the train's action set
+  (GO, WAIT, TERMINATE). For a bus, 0 is GO and anything else is HOLD.
+  The observation has one block per agent: a type flag, the agent's own
+  env features padded to the longer of the two, and two coupling fields
+  for trains. These are the expected wait for the next bus at its station
+  in its direction, and the expected extra journey time by bus over the
+  train for its riders (`transfer_cost`).
+- **The joint rule.** `TerminateWhenStuck` with the bus in the loop. A
+  train held at a closed block terminates when factor x the outage's
+  expected time left exceeds `transfer_cost`, its riders' mean extra time
+  by bus. That cost is: the wait until the next bus reaches the station,
+  plus the nominal bus ride to each call, minus the train's timetabled
+  time there. The fixed penalty x missed calls becomes a quantity read
+  from where the buses are. Baselines: no termination (route setting +
+  headway holding), and the bus-blind rule (the fixed 5-minute penalty).
+- **Why composition.** The corridor sim holds a `TrainSim` and a
+  `BusSim`, and the JAX env holds a `TrainState` and a `BusState`. The
+  coupling sits between their steps (the bus stops' waiting counts, the
+  credits), so neither env changes and both keep their parity tests.
+  The cost is that the rail passenger model stays coarse, at the
+  corridor level: a full one (per-station boarding, train capacity)
+  belongs in the train env (backlog).
+
+**Result.** `corridor/corridor-v0` and `busy-v0` (twice the bus demand).
+The JAX env matches the Python reference step for step, under random play
+and all three rules (`tests/test_corridor.py`). The rail line is
+`blockage` with TERMINATE: single track, 10-minute outages. The bus route
+is a loop of 8 stops with 4 buses, at about the train's 10-minute headway.
+
+- **Results** (`scripts/corridor_eval.py`; 2,048 episodes, seed 7;
+  passenger-minutes per episode; "vs blind" is the paired difference to
+  the bus-blind rule at factor 2):
+
+  | Policy | `corridor`: cost | vs blind | rail | bus | terminated/ep | `busy`: vs blind |
+  |---|---|---|---|---|---|---|
+  | No termination | 10,362 | +166 ± 16 | 675 | 9,687 | 0 | +150 ± 15 |
+  | Bus-blind, factor 1 | 10,283 | +88 ± 11 | 585 | 9,698 | 0.14 | +72 ± 10 |
+  | Bus-blind, factor 2 | 10,195 | 0 | 441 | 9,754 | 0.37 | 0 |
+  | **Bus-aware, factor 2** | **10,175** | **−20 ± 5** | 382 | 9,793 | 0.45 | −6 ± 5 |
+  | Bus-blind, factor 4 | 10,175 | −20 ± 5 | 382 | 9,793 | 0.45 | −6 ± 5 |
+
+- **What was learned.**
+  - Terminating a blocked train pays once a bus is there to take its
+    riders: 166 passenger-minutes an episode (1.6% of the total, but
+    25% of the rail riders' share once the bus's extra cost is netted off). Rail lateness falls from 675 to 382; the bus pays
+    back 106 of that for about 10 transferred riders, roughly 10 minutes
+    late each.
+  - The bus-aware rule wins by terminating *more* (0.45 vs 0.37 trains per
+    episode), not by timing it to where the buses are. Its estimated cost
+    (a few minutes of extra journey) is nearly always below factor x the
+    10-minute outage, so it makes the same choices as the bus-blind rule
+    at factor 4, which is "terminate whenever blocked". At smaller
+    factors, where the bus's position would tip decisions (0.25–0.75),
+    the paired differences are within ±5 passenger-minutes, i.e. noise.
+    The fixed 5-minute penalty overstates what a transfer costs when a
+    bus runs alongside every 10 minutes.
+  - Transfers cost more on a busy route: the gain over bus-blind drops
+    from 20 to 6 (not significant), because transferred riders crowd the
+    buses and slow boarding for everyone. `transfer_cost` ignores
+    crowding, so a rule (or a learner) that priced it would do better
+    there. That is a backlog item, and a place where coupling matters
+    that a single-mode env cannot show.
+  - The normalised score is dominated by the bus: random play holds
+    buses (2 of its 3 actions are HOLD), which costs far more than any
+    train decision. The rail rules sit between 0.95 and 1.00. Paired
+    differences in passenger-minutes are the meaningful comparison here;
+    the harness reports rail and bus costs separately for that reason.
 
 ## Backlog
+
+- Corridor: a crowding-aware `transfer_cost` (room on the next bus, the
+  dwell the extra boarding adds for everyone on board); bus holding for
+  transfers (connection protection); a rail passenger model inside the
+  train env (boarding per station, capacity), so riders waiting at missed
+  calls count too; correlated disruptions across modes (one event
+  closing a rail block and the road beside it); MAPPO on the corridor,
+  where trains and buses share one policy with a type flag.
 
 - GTFS loader for real bus and train networks and timetables.
 - Graph-network policies (the old repo has a GNN experiment in `scripts/gnn.py`).
@@ -624,8 +977,21 @@ designed for.
   rule that prices the queue behind a blocked train (trains waiting for
   it × expected time left); a value baseline for TERMINATE from rollouts
   (DLA, Powell's fourth class).
-- Publish to GitHub (`PaulAlexander23/transit-dispatch-bench`, public);
-  confirm with the user first.
+- Train failures (a train stops in its block for a random time), as done
+  for buses and lifts; demand surges in the core process. A closure-aware bus rule (hold
+  upstream buses while a road is shut). Bus response actions for
+  breakdowns: a spare bus, or short-turning the bus behind.
+- Route choice: general alternative routes on a graph (relief tracks
+  only cover a parallel track of equal length; a diversion via other
+  stations, skipping calls, needs per-route tables); an exact AND-OR
+  deadlock check for trains with two ways out; the shield and route
+  setting aware of the relief track (the shield vetoes on the main
+  track only); a reroute rule that weighs waiting for the main track
+  (expected time left) against the slower relief run.
+- CI: the workflow (`.github/workflows/ci.yml`) is not on GitHub yet: the
+  gh token lacks the `workflow` scope (`gh auth refresh -s workflow`),
+  so PR #1 went up without it. It is on the local `plan-rail-disruptions`
+  branch.
 
 ## Open questions
 

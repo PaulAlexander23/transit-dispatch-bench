@@ -49,7 +49,9 @@ def recorded(env):
 
 @pytest.mark.usefixtures("x64")
 @pytest.mark.parametrize("options", OPTIONS, ids=IDS)
-@pytest.mark.parametrize("preset", ["original", "multi", "kinematic", "hall_calls", "full"])
+@pytest.mark.parametrize(
+    "preset", ["original", "multi", "kinematic", "hall_calls", "full", "outage"]
+)
 def test_jax_matches_python_step_for_step(preset, options):
     env = ElevatorGymEnv(preset, max_steps=80, **options)
     jenv = ElevatorEnv(preset, max_steps=80, **options)
@@ -59,6 +61,9 @@ def test_jax_matches_python_step_for_step(preset, options):
         np.testing.assert_array_equal(jenv.observation_nvec, env.observation_space.nvec)
     n = env.config.n_floors
     drawn = recorded(env)
+    failures = []  # the car failure draws, when the preset has them
+    draw_failure = env.sim.draw_failure
+    env.sim.draw_failure = lambda: failures.append(draw_failure()) or failures[-1]
     step = jax.jit(jenv.step)
     reset = jax.jit(jenv.reset)
     rng = np.random.default_rng(0)
@@ -74,8 +79,10 @@ def test_jax_matches_python_step_for_step(preset, options):
         for _ in range(env.max_steps):
             action = rng.integers(env.action_space.nvec[0], size=env.config.n_lifts)
             drawn.clear()
+            failures.clear()
             obs, reward, _, truncated, info = env.step(action)
-            state, ts = step(state, action, arrivals_from_list(drawn[0], n))
+            failure = failures[0] if failures else None
+            state, ts = step(state, action, arrivals_from_list(drawn[0], n), failure)
             np.testing.assert_array_equal(obs, ts.observation)
             assert float(ts.reward) == pytest.approx(reward, rel=1e-12, abs=1e-12)
             assert bool(ts.truncated) == truncated
@@ -83,6 +90,43 @@ def test_jax_matches_python_step_for_step(preset, options):
             for name in ("delivered", "boarded", "waiting"):
                 assert int(ts.info[name]) == info[name]
         assert int(state.dropped) == 0
+
+
+@pytest.mark.usefixtures("x64")
+@pytest.mark.parametrize("options", [OPTIONS[0], OPTIONS[2], OPTIONS[3]], ids=IDS[:1] + IDS[2:4])
+def test_out_of_service_cars_match_python_step_for_step(options):
+    """Failures every few seconds, so every car goes out of service and back."""
+    from dataclasses import replace
+
+    from transit_bench.core.disruption import DisruptionConfig
+    from transit_bench.envs.elevator.sim import PRESETS
+
+    often = DisruptionConfig(mode="markov", rate_per_hour=360.0, mean_seconds=10.0)
+    config = replace(PRESETS["outage"], failure=often)
+    env = ElevatorGymEnv(config, max_steps=80, **options)
+    jenv = ElevatorEnv(config, max_steps=80, **options)
+    assert jenv.observation_size == env.observation_space.shape[0]
+    n = config.n_floors
+    drawn, failures = recorded(env), []
+    draw_failure = env.sim.draw_failure
+    env.sim.draw_failure = lambda: failures.append(draw_failure()) or failures[-1]
+    step = jax.jit(jenv.step)
+    obs, _ = env.reset(seed=0)
+    rounds = [arrivals_from_list(pairs, n) for pairs in drawn]
+    warmup = Arrivals(*(np.stack(field) for field in zip(*rounds, strict=True)))
+    state, ts = jax.jit(jenv.reset)(jax.random.key(0), warmup)
+    rng = np.random.default_rng(0)
+    seen = np.zeros(config.n_lifts, bool)
+    for _ in range(env.max_steps):
+        action = rng.integers(env.action_space.nvec[0], size=config.n_lifts)
+        drawn.clear()
+        failures.clear()
+        obs, reward, _, _, _ = env.step(action)
+        state, ts = step(state, action, arrivals_from_list(drawn[0], n), failures[0])
+        np.testing.assert_array_equal(obs, ts.observation)
+        assert float(ts.reward) == pytest.approx(reward, rel=1e-12, abs=1e-12)
+        seen |= env.sim.failure.down
+    assert seen.all()
 
 
 def test_random_policy_matches_python_in_distribution():

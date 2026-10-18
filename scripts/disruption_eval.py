@@ -23,25 +23,11 @@ import numpy as np
 
 from transit_bench import make
 from transit_bench.algos.imitate import warm_start
-from transit_bench.algos.ppo import PPOConfig, policy, train
+from transit_bench.algos.ppo import Greedy, PPOConfig, train
 from transit_bench.core.policy import make_rollout
 from transit_bench.envs.train.heuristic import FirstComeFirstServed, SectionReservation
 
 ENVS = ("train/single-v0", "train/blockage-v0")
-
-
-class Greedy:
-    """PPO params as a policy for make_rollout (reads the observation)."""
-
-    def __init__(self, env, params):
-        self.env, self.params = env, params
-
-    def init(self):
-        return jax.numpy.zeros((), jax.numpy.int32)
-
-    def act(self, carry, state, key):
-        logits, _ = policy(self.params, self.env.observe(state), self.env.n_agents)
-        return carry, logits.argmax(axis=-1).astype(jax.numpy.int32)
 
 
 def evaluate(env, pol, n_episodes, seed=7):

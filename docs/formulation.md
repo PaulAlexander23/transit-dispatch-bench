@@ -118,12 +118,56 @@ exceeds `c × missed calls`. Under Markov outages the expected time left is
 the mean whatever the elapsed time (memorylessness), so a rule needs only
 the mean; under semi-Markov ones the elapsed time is informative.
 
+Rerouting makes the route itself a decision: train `i` picks one of several
+block sequences, a binary `z_ir` per alternative `r` with `Σ_r z_ir = 1`, and
+each blocking disjunction on block `b` applies only if both trains' chosen
+routes use `b` (relaxed by `M(1 − z_ir)` otherwise). The env's relief tracks
+are the simplest case: two alternatives per section that differ only in
+which parallel track they take, so positions along the route line up and
+one binary per train and relief section suffices (`bound.py`). DIVERT is
+that choice made online, at the station before the section.
+
 ### Fleet
 
 Dynamic dial-a-ride on a grid or road graph. Each tick, assigning idle
 vehicles to waiting requests is a bipartite matching (Hungarian algorithm or
 an LP), which is a much stronger baseline than nearest idle vehicle. RL earns
 its keep on **repositioning** idle vehicles ahead of demand.
+
+The env's matching rule solves that assignment exactly with Bertsekas'
+auction algorithm: each unassigned vehicle bids for the request with the
+best value (benefit minus price), raising its price by the margin over the
+second best plus ε; with integer costs and ε below 1/n the final assignment
+is optimal. It runs in JAX as a `while_loop` of vectorised bidding rounds
+(a Hungarian solver's augmenting paths do not vectorise), and in integers
+(benefits scaled by n + 1, ε = 1) so it matches the Python reference
+exactly. Dummy "stay" objects, dearer than any pickup, make it serve as
+many requests as it can before minimising distance.
+
+### Coupled corridor
+
+The train and bus envs joined in one state (`corridor/*`). Each mode's
+model is unchanged; what couples them is the passengers. Let train i carry
+r riders for each call q after its origin. The objective is total
+passenger lateness:
+
+    min  Σ_i Σ_q r · late_iq
+
+late_iq is the train's lateness at q if it keeps running. If it
+terminates at station s at time τ, it is the bus arrival at q's stop minus
+sched_iq. Terminating replaces a fixed penalty per missed call with a
+quantity set by the bus system: the wait for a bus with room, the ride,
+and the delay that the extra boarding causes everyone already on board.
+This is an integrated disruption-management problem of the kind studied
+for rail–bus bridging (e.g. Kepaptsoglou & Karlaftis 2009; Jin et al.
+2016), here made online and sequential.
+
+Per tick, the env charges each rail rider still on board the change in
+its train's projected lateness. It charges each bus rider the tick, and
+credits each transferred rider until their scheduled arrival plus the
+lateness already charged. These sum to the objective, but the credit
+comes per tick: a lump credit at the transfer would make terminating look
+good at once and be billed later, a credit-assignment trap for RL.
 
 ## Disruptions as a stochastic process
 

@@ -51,8 +51,18 @@ def baselines(env_id, env):
 
         out["first come first served"] = FirstComeFirstServed(env)
         out["section reservation"] = SectionReservation(env)
-        if env.n_actions == 3 or env.infra.express.any():  # the heuristic adds to it
+        if env.n_actions > 2 or env.infra.express.any():  # the heuristic adds to it
             out["route setting"] = RouteSetting(env)
+    if family == "fleet":
+        from transit_bench.envs.fleet.heuristic import Matching, NearestIdle
+
+        out["nearest idle"] = NearestIdle(env)
+        out["matching"] = Matching(env)
+    if family == "corridor":
+        from transit_bench.envs.corridor.heuristic import BusBlind, NoTermination
+
+        out["no termination"] = NoTermination(env)
+        out["bus-blind terminate"] = BusBlind(env)
     out["heuristic"] = env.heuristic()
     return out
 
@@ -77,24 +87,74 @@ def domain_metrics(env_id, env, rewards, info):
         delay = -np.asarray(rewards).sum(axis=0) / env.n_trains
         worst = np.sort(delay)[-max(1, len(delay) // 10) :]
         deadlocks = (info["deadlocked"].max(axis=0) > 0).mean()
+        penalty = env.config.terminate_penalty > 0
         out = [
-            ("cost/train" if env.n_actions == 3 else "delay/train", f"{delay.mean():.2f} min"),
+            ("cost/train" if penalty else "delay/train", f"{delay.mean():.2f} min"),
             ("CVaR10", f"{worst.mean():.2f} min"),
             ("deadlocks", f"{deadlocks:.3f}"),
         ]
-        if env.n_actions == 3:
+        if env.has_relief:
+            out.append(("diverted/ep", f"{info['diverted'].sum(axis=0).mean():.2f}"))
+        if env.config.bridge_buses:
+            out.append(("bridged/ep", f"{info['bridged'].sum(axis=0).mean():.2f}"))
+        if penalty:
             out.append(("terminated/ep", f"{info['terminated'].sum(axis=0).mean():.2f}"))
         return out
+    if family == "fleet":
+        picked = info["picked_up"].sum(axis=0)
+        lost = info["abandoned"].sum(axis=0) + info["rejected"].sum(axis=0)
+        wait = info["wait_ticks"].sum() * env.config.step_seconds / max(picked.sum(), 1)
+        return [
+            ("served/ep", f"{picked.mean():.1f}"),
+            ("lost", f"{lost.sum() / max(picked.sum() + lost.sum(), 1):.3f}"),
+            ("mean wait", f"{wait / 60:.1f} min"),
+        ]
+    if family == "corridor":
+        bus = info["bus_cost"].sum(axis=0) - info["credit"].sum(axis=0)
+        n = max(info["departures"].sum(), 1)
+        return [
+            ("rail/ep", f"{info['rail_cost'].sum(axis=0).mean():.0f}"),
+            ("bus/ep", f"{bus.mean():.0f}"),
+            ("terminated/ep", f"{info['terminated'].sum(axis=0).mean():.2f}"),
+            ("transferred/ep", f"{info['transferred'].sum(axis=0).mean():.1f}"),
+            ("bunching", f"{info['bunched'].sum() / n:.3f}"),
+        ]
     return []
 
 
-def run(env_ids, n_episodes, seed=0):
-    """Rows of (env, policy, mean return, s.e., score, metrics)."""
+def ppo_config(env):
+    """The harness's PPO settings: MAPPO where the observation is one block
+    per agent, else PPO over the whole observation."""
+    from transit_bench.algos.ppo import PPOConfig
+
+    algo = "mappo" if env.per_agent_obs else "ppo"
+    return PPOConfig(
+        n_envs=512, n_steps=16, batch_size=2048, n_epochs=4, net_arch=(128, 128), algo=algo
+    )
+
+
+def trained(env_id, env, timesteps, seed=0):
+    """(name, greedy policy) after training on `env_id` for `timesteps`."""
+    from transit_bench.algos.ppo import Greedy, train
+
+    config = ppo_config(env)
+    params, _ = train(env_id, timesteps, config, seed=seed, verbose=False)
+    steps = f"{timesteps / 1e6:g}M" if timesteps >= 1e6 else f"{timesteps:,}"
+    return f"{config.algo} {steps}", Greedy(env, params)
+
+
+def run(env_ids, n_episodes, seed=0, ppo_timesteps=0):
+    """Rows of (env, policy, mean return, s.e., score, metrics). With
+    `ppo_timesteps`, also trains (MA)PPO on each env and adds its row."""
     rows = []
     for env_id in env_ids:
         env = make(env_id)
         results = {}
-        for name, policy in baselines(env_id, env).items():
+        policies = baselines(env_id, env)
+        if ppo_timesteps:
+            name, policy = trained(env_id, env, ppo_timesteps, seed)
+            policies[name] = policy
+        for name, policy in policies.items():
             rollout = jax.jit(make_rollout(env, policy, n_episodes, env.max_steps))
             rewards, info = rollout(jax.random.key(seed))
             returns = np.asarray(rewards).sum(axis=0)
@@ -139,9 +199,15 @@ def main(argv=None):
     parser.add_argument("--episodes", type=int, default=256)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--write", help="Markdown file to put the table in")
+    parser.add_argument(
+        "--ppo-timesteps",
+        type=int,
+        default=0,
+        help="also train (MA)PPO for this many steps on each env and add its row",
+    )
     args = parser.parse_args(argv)
     t0 = time.perf_counter()
-    rows = run(args.envs, args.episodes, args.seed)
+    rows = run(args.envs, args.episodes, args.seed, args.ppo_timesteps)
     table = markdown(rows, args.episodes)
     print(table)
     print(f"\n({time.perf_counter() - t0:.0f} s on {jax.devices()[0].platform})")

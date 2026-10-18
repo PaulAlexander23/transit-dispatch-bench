@@ -38,6 +38,26 @@ Dynamics, in ticks of `step_seconds`:
   working needs vehicle circulation, which the env does not model). Such
   a train *can terminate* and is active even if its next block is taken
   or closed, which is when terminating is worth considering.
+- With relief tracks (`relief_sections`) there is a fourth action, DIVERT:
+  a train *at a junction* (its next block starts a section with a relief
+  track) enters the relief track's first block instead of the main
+  track's, and then follows the relief track to the end of the section.
+  Such a train is deciding if either block is free and open; it is blocked
+  if the one it chose is not. The noise and incidents of the trip are per
+  route position, so they are the same on either track.
+- With `bridge_buses` > 0 there is a fifth action, BRIDGE: terminate as
+  TERMINATE does, and send the lowest-numbered free replacement bus to
+  serve the calls the train misses. The bus leaves the depot station at
+  once, drives (`road_ticks` per station, no noise) to the station where
+  the train ended its trip (its origin, if it never left), and on through
+  the train's remaining calls, dwelling at each. Each call then costs the
+  bus's lateness there against the train's timetable, capped at
+  `terminate_penalty`, instead of the penalty. The bus is busy until it
+  is back at the depot. A train *can bridge* if it can terminate, misses
+  at least one call and a bus is free at the start of the tick; if the
+  buses run out within the tick (earlier trains took them), BRIDGE holds.
+  This couples a second mode into the env as a shared resource; the bus
+  env's dynamics are not involved.
 
 Reward: minus the change in total *projected* lateness, in minutes. A
 train's projected lateness is how late it will be at its next scheduled
@@ -60,9 +80,9 @@ import numpy as np
 from transit_bench.core import disruption
 from transit_bench.envs.train.infra import PRESETS, TrainConfig, build
 
-GO, WAIT, TERMINATE = 0, 1, 2
+GO, WAIT, TERMINATE, DIVERT, BRIDGE = 0, 1, 2, 3, 4
 NOT_STARTED = -1
-HEAD_FIELDS = 15
+HEAD_FIELDS = 19
 LOOKAHEAD = 4  # blocks ahead on the route in each train's observation
 BLOCK_FIELDS = 6
 DELAY_SCALE = 600.0  # seconds: observation scale for delays and times
@@ -106,6 +126,9 @@ class TrainSim:
         self.trip = trip if trip is not None else self.draw_trip()
         self.t = 0
         self.pos = [NOT_STARTED] * T
+        # Per train and route position: on the relief track there.
+        self.relief = [[False] * self.infra.route.shape[1] for _ in range(T)]
+        self.bus_free = [0] * self.config.bridge_buses  # tick each bus is back at the depot
         self.remaining = [0] * T
         self.arrival_delay = [0.0] * T
         self.occupant = [-1] * self.infra.n_blocks
@@ -136,10 +159,26 @@ class TrainSim:
     def finished(self, i):
         return self.pos[i] >= self.infra.route_len[i]
 
+    def block_at(self, i, p):
+        """The block at route position p of train i, on the track it takes."""
+        table = self.infra.alt_route if self.relief[i][p] else self.infra.route
+        return int(table[i][p])
+
     def next_block(self, i):
-        """The block train i would enter next, or -1 from its last block."""
+        """The block train i would enter next (on the main track at a
+        junction), or -1 from its last block."""
         nxt = self.pos[i] + 1
-        return int(self.infra.route[i][nxt]) if nxt < self.infra.route_len[i] else -1
+        return self.block_at(i, nxt) if nxt < self.infra.route_len[i] else -1
+
+    def alt_block(self, i):
+        """At a junction, the relief block train i could enter instead; else -1."""
+        alt, nxt = self.infra.alt_route[i], self.pos[i] + 1
+        if self.finished(i) or nxt >= self.infra.route_len[i] or alt[nxt] < 0:
+            return -1
+        return int(alt[nxt]) if self.pos[i] == NOT_STARTED or alt[self.pos[i]] < 0 else -1
+
+    def free(self, b):
+        return b >= 0 and self.occupant[b] < 0 and self.block_open[b]
 
     def ready(self, i):
         if self.finished(i):
@@ -150,7 +189,7 @@ class TrainSim:
 
     def deciding(self, i):
         b = self.next_block(i)
-        return self.ready(i) and b >= 0 and self.occupant[b] < 0 and self.block_open[b]
+        return self.ready(i) and b >= 0 and (self.free(b) or self.free(self.alt_block(i)))
 
     def can_terminate(self, i):
         """Ready, not started or on a platform, and not at its last block."""
@@ -158,11 +197,38 @@ class TrainSim:
             return False
         return self.pos[i] == NOT_STARTED or self.infra.station_of[self.here(i)] >= 0
 
+    def free_bus(self):
+        """The lowest-numbered bus free now, or -1."""
+        return next((b for b, t in enumerate(self.bus_free) if t <= self.t), -1)
+
+    def can_bridge(self, i):
+        return self.can_terminate(i) and self.missed_calls(i) > 0 and self.free_bus() >= 0
+
+    def bridge_plan(self, i):
+        """If a bus bridged train i's missed calls from now: (their cost in
+        minutes, the tick the bus is back at the depot)."""
+        c, infra = self.config, self.infra
+        road, dwell = c.road_ticks, math.ceil(c.dwell_seconds / c.step_seconds)
+        p = self.pos[i]
+        start = int(infra.station_of[self.block_at(i, max(p, 0))])
+        leave = self.t + road * abs(c.depot - start)
+        cost, served, back = 0.0, 0, leave
+        for q in range(p + 1, int(infra.route_len[i])):
+            if infra.dwell[i][q] == 0:
+                continue
+            s = int(infra.station_of[self.block_at(i, q)])
+            arrive = leave + road * abs(s - start) + served * dwell
+            late = max(0.0, arrive * c.step_seconds - infra.sched[i][q])
+            cost += min(c.terminate_penalty, late / 60)
+            served += 1
+            back = arrive + dwell + road * abs(s - c.depot)
+        return cost, back
+
     def here(self, i):
         """The block train i holds, or -1."""
         if self.pos[i] == NOT_STARTED or self.finished(i):
             return -1
-        return int(self.infra.route[i][self.pos[i]])
+        return self.block_at(i, self.pos[i])
 
     def missed_calls(self, i):
         """Calls train i would miss if it terminated now."""
@@ -178,12 +244,15 @@ class TrainSim:
         return max(0.0, exit_time - sched[self.pos[i] + 1])
 
     def waits_for(self):
-        """Per train, the train holding the block it is ready to enter, or -1."""
+        """Per train, the train holding the block it is ready to enter, or -1.
+        A train at a junction with the relief block free waits for no one;
+        with it taken, it counts as waiting for the main block's holder only
+        (an approximation: it is stuck only if both holders are)."""
         out = []
         for i in range(len(self.pos)):
             b = self.next_block(i)
             started = self.pos[i] != NOT_STARTED
-            waiting = started and self.ready(i) and b >= 0
+            waiting = started and self.ready(i) and b >= 0 and not self.free(self.alt_block(i))
             out.append(self.occupant[b] if waiting else -1)
         return out
 
@@ -212,50 +281,78 @@ class TrainSim:
         if exo is None:
             exo = self.draw()
         now = self.t * c.step_seconds
-        keys = ("entered", "arrived", "held", "blocked", "terminated", "missed")
+        keys = (
+            "entered",
+            "arrived",
+            "held",
+            "blocked",
+            "terminated",
+            "missed",
+            "diverted",
+            "bridged",
+        )
         info = dict.fromkeys(keys, 0)
         T = len(self.pos)
         ready = [self.ready(i) for i in range(T)]
         deciding = [self.deciding(i) for i in range(T)]
         can_terminate = [self.can_terminate(i) for i in range(T)]
+        can_bridge = [self.can_bridge(i) for i in range(T)]
+        options = [(self.next_block(i), self.alt_block(i)) for i in range(T)]
+        free = [(self.free(b), self.free(a)) for b, a in options]
         claimed = set()
         for i in range(T):
             if not ready[i]:
                 continue
-            if can_terminate[i] and int(actions[i]) == TERMINATE:
+            bridge = can_bridge[i] and int(actions[i]) == BRIDGE and self.free_bus() >= 0
+            if bridge or (can_terminate[i] and int(actions[i]) == TERMINATE):
                 missed = self.missed_calls(i)
                 late = self.projected_delay(i, now)
+                cost = c.terminate_penalty * missed
+                if bridge:
+                    cost, back = self.bridge_plan(i)
+                    self.bus_free[self.free_bus()] = back
+                    info["bridged"] += 1
                 if self.pos[i] != NOT_STARTED:
                     self.occupant[self.here(i)] = -1
                 self.pos[i] = int(infra.route_len[i])
-                self.arrival_delay[i] = late + 60 * c.terminate_penalty * missed
+                self.arrival_delay[i] = late + 60 * cost
                 info["terminated"] += 1
                 info["missed"] += missed
                 continue
             b = self.next_block(i)
             if b < 0:  # leave the network from the last block
-                self.occupant[int(infra.route[i][self.pos[i]])] = -1
+                self.occupant[self.here(i)] = -1
                 self.pos[i] = int(infra.route_len[i])
                 self.arrival_delay[i] = max(0.0, now - infra.sched[i][self.pos[i]])
                 info["arrived"] += 1
                 continue
-            if not deciding[i] or b in claimed:
+            divert = int(actions[i]) == DIVERT and options[i][1] >= 0
+            if divert:
+                b = options[i][1]
+            if not deciding[i] or not free[i][divert] or b in claimed:
                 info["blocked"] += 1
                 continue
-            if int(actions[i]) != GO:
+            if int(actions[i]) != GO and not divert:
                 info["held"] += 1
                 continue
             if self.pos[i] != NOT_STARTED:
-                self.occupant[int(infra.route[i][self.pos[i]])] = -1
+                self.occupant[self.here(i)] = -1
             self.pos[i] += 1
+            p = self.pos[i]
+            if divert:  # onto the relief track, to the end of the section
+                q = p
+                while q < infra.route_len[i] and infra.alt_route[i][q] >= 0:
+                    self.relief[i][q] = True
+                    q += 1
             self.occupant[b] = i
             claimed.add(b)
-            p = self.pos[i]
             noise, incident = self.trip.noise[i][p], self.trip.incident[i][p]
-            seconds = infra.run[i][p] * self.block_speed[b] * noise + incident
+            run = infra.alt_run[i][p] if self.relief[i][p] else infra.run[i][p]
+            seconds = run * self.block_speed[b] * noise + incident
             ticks = max(1, math.ceil(seconds / c.step_seconds - 1e-9))
             self.remaining[i] = ticks + int(infra.dwell[i][p])
             info["entered"] += 1
+            info["diverted"] += divert
         for i in range(T):
             if self.remaining[i] > 0:
                 self.remaining[i] -= 1
@@ -280,8 +377,10 @@ class TrainSim:
         Head: not started, running (time left in its block), deciding,
         finished, progress along its route, time left in its block and
         projected delay (over DELAY_SCALE, capped at 1), express, westbound,
-        can terminate, and the calls it would miss if it did (over the
-        number of stations);
+        can terminate, the calls it would miss if it did (over the
+        number of stations), at a junction, the relief block there is
+        free and open, can bridge, and what bridging would cost (over
+        `terminate_penalty` x the number of stations);
         then, for the next section it will enter: its next block is in it
         (it would enter the section now); a train going the other way is in
         it; one is deciding to enter it this tick ahead of this train in the
@@ -317,6 +416,10 @@ class TrainSim:
                 float(infra.direction[i]),
                 float(self.can_terminate(i)),
                 self.missed_calls(i) / self.config.n_stations if not self.finished(i) else 0.0,
+                float(self.alt_block(i) >= 0),
+                float(self.free(self.alt_block(i))),
+                float(self.can_bridge(i)),
+                self._bridge_field(i),
             ]
             sec, d = target[i], infra.direction[i]
             inside = sec >= 0 and any(
@@ -334,7 +437,7 @@ class TrainSim:
             for k in range(1, LOOKAHEAD + 1):
                 p = self.pos[i] + k
                 if p < n:
-                    b = int(infra.route[i][p])
+                    b = self.block_at(i, p)
                     j = self.occupant[b]
                     same = j >= 0 and infra.direction[j] == infra.direction[i]
                     ahead += [1.0, float(j >= 0), float(same), float(self.block_open[b])]
@@ -343,6 +446,11 @@ class TrainSim:
                     ahead += [0.0] * BLOCK_FIELDS
             out.append(head + ahead)
         return np.array(out, dtype=np.float32).ravel()
+
+    def _bridge_field(self, i):
+        if not self.can_bridge(i):
+            return 0.0
+        return self.bridge_plan(i)[0] / (self.config.terminate_penalty * self.config.n_stations)
 
     def _outage(self, b):
         d, c = self.disruption, self.config.disruption
@@ -380,7 +488,7 @@ class TrainSim:
                 out.append(-1)
                 continue
             sec = int(infra.section_of[self.next_block(i)])
-            here = int(infra.route[i][self.pos[i]]) if self.pos[i] != NOT_STARTED else -1
+            here = self.here(i)
             if sec >= 0 and here >= 0 and infra.section_of[here] == sec:
                 sec = -1  # already inside
             out.append(sec)
@@ -414,7 +522,7 @@ def section_reservation(sim):
             actions.append(GO)
             continue
         section = int(infra.section_of[b])
-        here = int(infra.route[i][sim.pos[i]]) if sim.pos[i] != NOT_STARTED else -1
+        here = sim.here(i)
         if here >= 0 and infra.section_of[here] == section:
             actions.append(GO)  # already inside: carry on
             continue
@@ -453,7 +561,7 @@ def route_setting(sim):
             continue
         b = sim.next_block(i)
         section = int(infra.section_of[b])
-        here = int(infra.route[i][sim.pos[i]]) if sim.pos[i] != NOT_STARTED else -1
+        here = sim.here(i)
         if section < 0 or (here >= 0 and infra.section_of[here] == section):
             continue
         if not infra.section_shared[section]:
@@ -464,7 +572,56 @@ def route_setting(sim):
     return actions
 
 
-def terminate_when_stuck(sim, rule=route_setting, factor=2.0):
+def reroute(sim, rule=route_setting):
+    """`rule`, plus: at a junction, take the relief track when the main one
+    is no good now.
+
+    A deciding train at a junction keeps `rule`'s GO if the main track's
+    next block is free and none of the section's main blocks is closed.
+    Otherwise it diverts if the relief track is usable: its first block
+    free, none of its blocks closed, no train going the other way in it or
+    diverting into it this tick ahead of this one, and (route setting, as
+    the relief track carries both directions) the platform at its far end
+    free. Otherwise it keeps `rule`'s action. So it diverts around a
+    closure, around a train in the main section, and to cross an oncoming
+    train between stations; it never weighs the relief track's slower
+    running against how soon the main track will clear.
+    """
+    actions = list(rule(sim))
+    infra = sim.infra
+    entering = {}  # relief section -> directions diverting into it this tick, so far
+    for i in range(len(sim.pos)):
+        a = sim.alt_block(i)
+        if a < 0 or not sim.deciding(i):
+            continue
+        q = sim.pos[i] + 1
+        span = [p for p in range(q, int(infra.route_len[i])) if infra.alt_route[i][p] >= 0]
+        span = span[: next((n for n, p in enumerate(span) if p != q + n), len(span))]
+        main_ok = sim.free(sim.next_block(i)) and all(
+            sim.block_open[int(infra.route[i][p])] for p in span
+        )
+        if actions[i] == GO and main_ok:
+            continue
+        section, d = int(infra.section_of[a]), infra.direction[i]
+        against = any(
+            j >= 0 and infra.section_of[blk] == section and infra.direction[j] != d
+            for blk, j in enumerate(sim.occupant)
+        )
+        against |= any(other != d for other in entering.get(section, []))
+        far = int(infra.far_platform[i][q])
+        usable = (
+            sim.free(a)
+            and all(sim.block_open[int(infra.alt_route[i][p])] for p in span)
+            and not against
+            and not (far >= 0 and sim.occupant[far] >= 0)
+        )
+        if usable:
+            actions[i] = DIVERT
+            entering.setdefault(section, []).append(d)
+    return actions
+
+
+def terminate_when_stuck(sim, rule=route_setting, factor=2.0, cost=None):
     """`rule`, plus TERMINATE where waiting looks dearer than the missed calls.
 
     A train that can terminate does so when its next block is closed and
@@ -479,10 +636,28 @@ def terminate_when_stuck(sim, rule=route_setting, factor=2.0):
     and a rough guess for semi-Markov ones. It also breaks deadlocks: of the
     deadlocked trains that can terminate, the one missing fewest calls
     (lowest index on a tie) terminates; one per tick.
+    With bridging buses, ending a trip costs the cheaper of the penalty and
+    bridging (`bridge_plan`); free buses go to trains in index order, and
+    the threshold above uses that cheaper cost, so buses make terminating
+    worth it more often.
+    `cost`, if given, is per train the seconds that terminating costs in
+    place of the penalty (the corridor env's `transfer_cost`).
     """
     actions = list(rule(sim))
     c = sim.config
     T = len(sim.pos)
+    buses = sum(t <= sim.t for t in sim.bus_free)  # free now, handed out in train order
+
+    def end(i):
+        """The cheaper way to end train i's trip: (action, cost in seconds)."""
+        nonlocal buses
+        penalty = 60 * c.terminate_penalty * sim.missed_calls(i) if cost is None else cost[i]
+        if buses > 0 and sim.can_bridge(i):
+            bridged = 60 * sim.bridge_plan(i)[0]
+            if bridged < penalty:
+                return BRIDGE, bridged
+        return TERMINATE, penalty
+
     for i in range(T):
         if not sim.can_terminate(i):
             continue
@@ -491,12 +666,17 @@ def terminate_when_stuck(sim, rule=route_setting, factor=2.0):
             continue
         d = sim.disruption
         left = d.remaining[b] if c.disruption.observe_remaining else c.disruption.mean_seconds
-        if factor * left > 60 * c.terminate_penalty * sim.missed_calls(i):
-            actions[i] = TERMINATE
+        action, price = end(i)
+        if factor * left > price:
+            actions[i] = action
+            buses -= action == BRIDGE
     stuck = sim.deadlocked_trains()
     options = [(sim.missed_calls(i), i) for i in range(T) if stuck[i] and sim.can_terminate(i)]
     if options:
-        actions[min(options)[1]] = TERMINATE
+        i = min(options)[1]
+        if actions[i] not in (TERMINATE, BRIDGE):
+            action, _ = end(i)
+            actions[i] = action
     return actions
 
 
@@ -562,12 +742,14 @@ def give_way_to_express(sim, rule=route_setting):
 
 def heuristic(sim):
     """The env's heuristic (`TrainEnv.heuristic`): route setting, giving way
-    to expresses where there are any, and terminating when stuck where the
-    config allows it."""
+    to expresses where there are any, rerouting where there are relief
+    tracks, and terminating when stuck where the config allows it."""
 
     def rule(sim):
         if sim.infra.express.any():
             return give_way_to_express(sim)
+        if (sim.infra.alt_route >= 0).any():
+            return reroute(sim)
         return route_setting(sim)
 
     if sim.config.terminate_penalty > 0:

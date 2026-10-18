@@ -13,6 +13,8 @@ from transit_bench.envs.train import PRESETS, TrainConfig, TrainEnv
 from transit_bench.envs.train.heuristic import FirstComeFirstServed, SectionReservation
 from transit_bench.envs.train.infra import EAST, WEST, build
 from transit_bench.envs.train.sim import (
+    BRIDGE,
+    DIVERT,
     GO,
     TERMINATE,
     WAIT,
@@ -22,6 +24,7 @@ from transit_bench.envs.train.sim import (
     first_come_first_served,
     give_way_to_express,
     heuristic,
+    reroute,
     route_setting,
     section_reservation,
     terminate_when_stuck,
@@ -221,25 +224,28 @@ def replay(preset, policy, seed):
 @pytest.mark.parametrize("preset", PRESETS)
 def test_jax_matches_python_step_for_step(preset):
     for seed in range(2):
-        # Three actions everywhere: without a terminate_penalty, TERMINATE is a WAIT.
-        replay(preset, lambda sim, rng: rng.integers(3, size=len(sim.pos)), seed)
+        # Five actions everywhere: TERMINATE without a terminate_penalty,
+        # DIVERT away from a junction and BRIDGE without buses hold as WAIT does.
+        replay(preset, lambda sim, rng: rng.integers(5, size=len(sim.pos)), seed)
         replay(preset, lambda sim, rng: first_come_first_served(sim), seed)
         replay(preset, lambda sim, rng: section_reservation(sim), seed)
         replay(preset, lambda sim, rng: route_setting(sim), seed)
         replay(preset, lambda sim, rng: terminate_when_stuck(sim), seed)
+        replay(preset, lambda sim, rng: reroute(sim), seed)
         replay(preset, lambda sim, rng: heuristic(sim), seed)
 
 
 @pytest.mark.usefixtures("x64")
 @pytest.mark.parametrize("preset", PRESETS)
 def test_jax_heuristics_match_python(preset):
-    from transit_bench.envs.train.heuristic import GiveWayToExpress, RouteSetting
+    from transit_bench.envs.train.heuristic import GiveWayToExpress, Reroute, RouteSetting
 
     env = TrainEnv(preset)
     for policy, reference in [
         (env.heuristic(), heuristic),
         (RouteSetting(env), route_setting),
         (GiveWayToExpress(env), give_way_to_express),
+        (Reroute(env), reroute),
         (SectionReservation(env), section_reservation),
         (FirstComeFirstServed(env), first_come_first_served),
     ]:
@@ -406,8 +412,7 @@ def responsive(**changes):
         trains_per_direction=1,
         running_cv=0,
         incident_probability=0,
-        terminate_penalty=5.0,
-        **changes,
+        **({"terminate_penalty": 5.0} | changes),
     )
 
 
@@ -491,3 +496,105 @@ def test_giving_way_to_the_express_reaches_the_bound_when_deterministic():
     assert finished and float(give_way) == pytest.approx(bound, abs=1e-6)
     route, _ = run(env, RouteSetting(env), key)
     assert float(route) > bound + 5  # 12.2 vs 3.6 minutes of lateness in total
+
+
+# -- route choice ------------------------------------------------------------------
+
+
+def relieved(**changes):
+    """One train each way on the single-track line, calm, with a relief track
+    alongside section 1 (stations 1 to 2)."""
+    return replace(
+        PRESETS["single"],
+        trains_per_direction=1,
+        running_cv=0,
+        incident_probability=0,
+        relief_sections=(1,),
+        **changes,
+    )
+
+
+def test_relief_track_is_an_alternative_for_one_section_both_ways():
+    infra = build(relieved())
+    k = relieved().blocks_per_section
+    assert TrainEnv(relieved()).n_actions == 4
+    for i in range(2):
+        alt = infra.alt_route[i]
+        assert (alt >= 0).sum() == k  # the one section, in either direction
+        positions = np.flatnonzero(alt >= 0)
+        assert set(infra.section_of[alt[positions]]) == {infra.section_of.max()}
+        assert (infra.alt_run[i, positions] == 1.25 * infra.run[i, positions]).all()
+    # Both directions use it, so route setting treats it as single track.
+    assert infra.section_shared[infra.section_of.max()]
+
+
+def run_train_zero(sim, choose):
+    exo = calm(sim)
+    blocks = set()
+    while not sim.finished(0):
+        sim.step([choose(sim), WAIT], exo)
+        if not sim.finished(0):
+            blocks.add(sim.here(0))
+    return blocks, sim.arrival_delay[0]
+
+
+def test_diverting_takes_the_relief_track_to_the_end_of_the_section():
+    main_blocks, _ = run_train_zero(TrainSim(relieved()), lambda sim: GO)
+    sim = TrainSim(relieved())
+    relief_blocks, late = run_train_zero(sim, lambda sim: DIVERT if sim.alt_block(0) >= 0 else GO)
+    alt = sim.infra.alt_route[0]
+    assert set(alt[alt >= 0]) <= relief_blocks and not set(alt[alt >= 0]) & main_blocks
+    # 2 blocks x 90 s x 1.25 = 2 x 12 ticks instead of 2 x 9: 60 s later,
+    # less the timetable's slack (5% of the 1170 s nominal run).
+    infra = sim.infra
+    slack = infra.sched[0, -1] - 10.0 * infra.cum_ticks[0, -1]
+    assert late == pytest.approx(60 - slack)
+
+
+def test_reroute_goes_around_a_closed_block_where_route_setting_waits():
+    from transit_bench.core.disruption import DisruptionConfig
+    from transit_bench.envs.train.heuristic import Reroute, RouteSetting
+
+    infra = build(relieved())
+    closed = int(infra.route[0][np.flatnonzero(infra.alt_route[0] >= 0)[0]])
+    window = ((closed, 0.0, 1800.0),)
+    c = relieved(disruption=DisruptionConfig(mode="scripted", scripted=window))
+    env = TrainEnv(c, max_steps=720)
+    from transit_bench.envs.train.bound import run
+
+    key = jax.random.key(0)
+    waited, done_wait = run(env, RouteSetting(env), key)
+    diverted, done_divert = run(env, Reroute(env), key)
+    assert done_wait and done_divert
+    assert float(diverted) < float(waited) - 20  # the eastbound train waits out ~25 minutes
+
+
+# -- bus bridging ----------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("x64")
+def test_bridging_a_cancelled_train_is_cheaper_and_keeps_the_bus_busy():
+    c = responsive(terminate_penalty=15.0, bridge_buses=1)
+    sim = TrainSim(c)
+    env = TrainEnv(c)
+    assert env.n_actions == 5
+    state, _ = env.reset(jax.random.key(0), sim.trip)
+    calm(sim)
+    state = state._replace(trip=Trip(jnp.asarray(sim.trip.noise), jnp.asarray(sim.trip.incident)))
+    assert sim.can_bridge(0)
+    cost, back = sim.bridge_plan(0)
+    jcost, jback = env.bridge_plan(state)
+    assert float(jcost[0]) == pytest.approx(cost) and int(jback[0]) == back
+    # The bus drives 2 stations from the depot to the origin, then serves
+    # all 5 calls late, but each costs at most the penalty.
+    assert 0 < cost < 15.0 * 5
+    exo = Exogenous(np.ones(sim.infra.n_blocks), np.zeros(sim.infra.n_blocks))
+    _, reward, _, _, info = sim.step([BRIDGE, GO], exo)
+    state, ts = env.step(state, jnp.array([BRIDGE, GO]), exo)
+    assert info["bridged"] == 1 and int(ts.info["bridged"]) == 1
+    assert reward == pytest.approx(-cost) and float(ts.reward) == pytest.approx(-cost)
+    assert sim.bus_free == [back] and int(state.bus_free[0]) == back
+    # The only bus is out, so the westbound train cannot bridge when due.
+    while not sim.can_terminate(1):
+        sim.step([GO, WAIT], exo)
+    assert not sim.can_bridge(1)

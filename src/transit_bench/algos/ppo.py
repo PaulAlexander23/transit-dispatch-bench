@@ -188,6 +188,23 @@ def policy(params, obs, n_agents):
     return logits, mlp(params["vf"], obs)[..., 0]
 
 
+class Greedy:
+    """Trained params as a `core.policy.Policy`: each agent's most likely
+    action, from the env's observation of the state."""
+
+    def __init__(self, env, params):
+        self.env, self.params = env, params
+        self.features = make_features(env)
+
+    def init(self):
+        return jnp.zeros((), jnp.int32)
+
+    def act(self, carry, state, key=None):
+        obs = self.features(self.env.observe(state))
+        logits, _ = policy(self.params, obs, self.env.n_agents)
+        return carry, logits.argmax(axis=-1).astype(jnp.int32)
+
+
 def log_prob(logits, actions, active=None):
     """Log-probability of a MultiDiscrete action: the sum over agents.
 

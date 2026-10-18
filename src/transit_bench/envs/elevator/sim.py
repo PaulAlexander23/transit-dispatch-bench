@@ -30,6 +30,9 @@ from dataclasses import dataclass, field, replace
 
 import numpy as np
 
+from transit_bench.core import disruption
+from transit_bench.core.disruption import DisruptionConfig
+
 TRAFFIC_PROFILES = ("uniform", "up_peak", "down_peak", "lunch", "day")
 
 # Mixture weights over the (up-peak, interfloor, down-peak) patterns.
@@ -76,6 +79,11 @@ class ElevatorConfig:
     door_time: float = 4.0  # s, open + dwell + close
     step_seconds: float = 1.0
     substeps: int = 10
+    # Cars going out of service at random (each lift an "edge" of the core
+    # disruption process, closed while down); none by default. An out-of-
+    # service car ignores its actions: it finishes any move and door cycle
+    # under way, then stands, with anyone on board, until it is back.
+    failure: DisruptionConfig = DisruptionConfig()
 
     def __post_init__(self):
         if self.traffic not in TRAFFIC_PROFILES:
@@ -84,6 +92,8 @@ class ElevatorConfig:
             raise ValueError("need at least 2 floors, 1 lift and a capacity of 1")
         if self.substeps < 1:
             raise ValueError("substeps must be at least 1")
+        if self.failure.speed != 0 or self.failure.mode == "scripted":
+            raise ValueError("car failures stop the car (speed 0) and are random")
 
     @property
     def n_actions(self):
@@ -99,6 +109,13 @@ PRESETS["multi"] = replace(PRESETS["tall"], n_lifts=4)
 PRESETS["kinematic"] = replace(PRESETS["multi"], kinematics=True)
 PRESETS["hall_calls"] = replace(PRESETS["kinematic"], hall_calls=True)
 PRESETS["full"] = replace(PRESETS["hall_calls"], traffic="day")
+# Cars out of service on `full`: each fails 3 times an hour for a minute on
+# average, so about 0.7 failures in a 200-step (200 s) episode across the
+# 4 cars.
+PRESETS["outage"] = replace(
+    PRESETS["full"],
+    failure=DisruptionConfig(mode="markov", rate_per_hour=3.0, mean_seconds=60.0),
+)
 
 
 @dataclass
@@ -152,6 +169,7 @@ class ElevatorSim:
             lifts=[Lift() for _ in range(c.n_lifts)],
             floor_queues=[deque() for _ in range(c.n_floors)],
         )
+        self.failure = disruption.initial_np(c.n_lifts)
 
     def state(self):
         return self._state
@@ -200,6 +218,21 @@ class ElevatorSim:
         joint = np.divide(joint, sums, out=np.full_like(joint, 1 / c.n_floors), where=sums > 0)
         return rates, joint
 
+    def out_of_service(self, i):
+        return bool(self.failure.down[i])
+
+    def draw_failure(self):
+        """This step's draws for the car failure process."""
+        return disruption.draw_np(self.config.failure, self.rng, self.config.n_lifts)
+
+    def advance_failure(self, draw, now):
+        """Move the car failure process on by one step (at the end of it)."""
+        c = self.config
+        eligible = np.ones(c.n_lifts, bool)
+        self.failure = disruption.step_np(
+            c.failure, self.failure, draw, eligible, now, c.step_seconds
+        )
+
     def apply_actions(self, actions):
         """Apply one action per lift, in lift order, then advance time.
 
@@ -211,6 +244,8 @@ class ElevatorSim:
         boarded = [0] * c.n_lifts
         served = [False] * c.n_lifts
         for i, (lift, action) in enumerate(zip(self._state.lifts, actions, strict=True)):
+            if self.out_of_service(i):
+                continue
             action = int(action)
             if action in (UP, DOWN):
                 self._move(lift, 1 if action == UP else -1)
