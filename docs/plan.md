@@ -4,6 +4,16 @@ Started 2026-10-17. This is the live plan: tick items off, and add a short
 **Result** under each phase as it finishes (what was built, numbers, what was
 learned, and anything deferred to the backlog).
 
+**Where we are (2026-10-18).** Phases 0–9 are done. Three PRs are open
+and stacked: #3 (applications doc) ← #4 (Phase 8, general rail networks)
+← #5 (Phase 9, runway sequencing). Merge them in that order; each
+retargets to `main`. Next, from the backlog: electric bus charging (a
+charge state and chargers, on `bus` or `fleet`). Also pending: check the
+paper references (applications.md, the runway env), the CI workflow (on
+the local `plan-rail-disruptions` branch, waiting on the token's
+`workflow` scope), and revisiting applications.md when the backlog runs
+low.
+
 ## Goal
 
 A suite of RL benchmark environments for passenger dispatch on transport
