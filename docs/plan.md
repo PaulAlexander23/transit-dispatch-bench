@@ -36,6 +36,14 @@ planning baseline and, on small presets, a hindsight-optimal bound.
 The maths is in [formulation.md](formulation.md); the survey in
 [related-work.md](related-work.md).
 
+How the suite grows: take an application, distil its hard core into a
+mathematical model, and build an env only if that core is new. If it
+matches an existing model, record it as an instance of the closest env
+instead. [applications.md](applications.md) has the method and the
+applications assessed so far (waterways, locks, mining, trams, metro,
+shared lift shafts, airports, airlines, air traffic, shunting, robots,
+electric buses), each with the complexity it would add.
+
 ## Where this comes from
 
 Learning from [elevator-dispatching-rl](https://github.com/PaulAlexander23/elevator-dispatching-rl)
@@ -935,6 +943,21 @@ is a loop of 8 stops with 4 buses, at about the train's 10-minute headway.
     the harness reports rail and bus costs separately for that reason.
 
 ## Backlog
+
+- New cores from [applications.md](applications.md), in the recommended
+  order:
+  - runway sequencing (sequence-dependent separation times; exact bound,
+    constrained position shifting as the rule);
+  - electric bus charging (a charge state and charger resources, on `bus`
+    or `fleet`);
+  - lock scheduling (a batch server with packing and a direction setup);
+  - capacity above 1 (cumulative constraints: air traffic flow, channels,
+    depots);
+  - last-in, first-out storage (depot shunting, container stacking).
+
+  Extensions: a shared lift shaft on `elevator`, capacity-1 nodes on
+  `fleet` (warehouse robots), and a throughput objective with cyclic jobs
+  (mine haul roads).
 
 - Corridor: a crowding-aware `transfer_cost` (room on the next bus, the
   dwell the extra boarding adds for everyone on board); bus holding for

@@ -16,6 +16,9 @@ ported from there (see the plan for which commits and files).
 - When asked for a recommendation, give one with its reasoning. Check the
   risks of a big new dependency before adopting it.
 - This is a learning exercise: explain trade-offs and implementation details.
+- New applications: distil the hard core into a mathematical model first.
+  If it matches an existing env, record it as an instance of the closest
+  one in docs/applications.md rather than building a duplicate model.
 
 ## Machine
 
