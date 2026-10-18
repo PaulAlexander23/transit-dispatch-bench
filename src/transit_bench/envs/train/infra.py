@@ -41,6 +41,45 @@ EAST, WEST = 0, 1
 
 
 @dataclass(frozen=True)
+class Network:
+    """A rail network: stations 0 .. n_stations - 1, edges between them and
+    the services that run on it.
+
+    - `edges`: (u, v, single_track) per section; a section has
+      `blocks_per_section` blocks, one track per heading on double track,
+      one shared track on single track.
+    - `services`: (stations, n_trains, headway, offset) per service: its
+      station path (consecutive stations must share an edge), and its
+      trains departing every `headway` seconds from `offset`. Every train
+      stops at every station on its path.
+
+    A train's *heading* on a section is 0 travelling from the lower- to the
+    higher-numbered station, 1 the other way. Each station has a platform
+    per heading; a train uses the one for the heading it leaves on (it
+    arrives on, at its last station), so opposing trains can cross there.
+    """
+
+    n_stations: int
+    edges: tuple
+    services: tuple
+
+    def __post_init__(self):
+        pairs = set()
+        for u, v, _ in self.edges:
+            if not (0 <= u < self.n_stations and 0 <= v < self.n_stations) or u == v:
+                raise ValueError(f"bad edge {(u, v)}")
+            if (min(u, v), max(u, v)) in pairs:
+                raise ValueError(f"duplicate edge {(u, v)}")
+            pairs.add((min(u, v), max(u, v)))
+        for path, n, headway, _ in self.services:
+            if len(path) < 2 or n < 1 or headway <= 0:
+                raise ValueError("a service needs 2+ stations, 1+ trains and a headway > 0")
+            for a, b in zip(path[:-1], path[1:], strict=True):
+                if (min(a, b), max(a, b)) not in pairs:
+                    raise ValueError(f"service path {path} uses a missing edge {(a, b)}")
+
+
+@dataclass(frozen=True)
 class TrainConfig:
     n_stations: int = 5
     blocks_per_section: int = 2
@@ -81,6 +120,11 @@ class TrainConfig:
     bridge_buses: int = 0
     bus_slowdown: float = 1.5
     bridge_depot: int = -1
+    # A general network (see `Network`) in place of the line; then
+    # n_stations must match it, and the line's own options (single_track,
+    # passing loops, expresses, relief tracks, bridging and the
+    # trains_per_direction / headway / west_offset timetable) don't apply.
+    network: Network | None = None
 
     def __post_init__(self):
         if self.n_stations < 2 or self.blocks_per_section < 1:
@@ -97,6 +141,21 @@ class TrainConfig:
             raise ValueError("bridge_buses needs terminate_penalty > 0")
         if not -1 <= self.bridge_depot < self.n_stations:
             raise ValueError("bridge_depot must be a station, or -1 for the middle one")
+        if self.network is not None:
+            if self.network.n_stations != self.n_stations:
+                raise ValueError("n_stations must match the network's")
+            line_only = (
+                self.single_track,
+                self.passing_loops,
+                self.express_every,
+                self.relief_sections,
+                self.bridge_buses,
+            )
+            if any(line_only):
+                raise ValueError(
+                    "single_track, passing_loops, express_every, relief_sections and "
+                    "bridge_buses are line options; a network sets tracks per edge"
+                )
 
     @property
     def depot(self):
@@ -110,6 +169,8 @@ class TrainConfig:
 
     @property
     def n_trains(self):
+        if self.network is not None:
+            return sum(n for _, n, _, _ in self.network.services)
         return 2 * self.trains_per_direction
 
 
@@ -140,6 +201,33 @@ PRESETS["junction"] = replace(PRESETS["blockage"], relief_sections=(1, 2))
 # Bus bridging: `response` on a line where a missed call costs 15 minutes
 # (a 30-minute headway), with 2 replacement buses at the middle station.
 PRESETS["bridge"] = replace(PRESETS["response"], terminate_penalty=15.0, bridge_buses=2)
+
+
+# A branching network: a double-track trunk (stations 0-1-2) splits at
+# station 2 into two single-track branches (2-3-4 and 2-5-6), with one
+# service per branch each way, 4 trains every 10 minutes, the second
+# branch's 5 minutes after the first's. Trains merge onto the trunk at the
+# junction and cross each other on the branches.
+BRANCH = Network(
+    n_stations=7,
+    edges=(
+        (0, 1, False),
+        (1, 2, False),
+        (2, 3, True),
+        (3, 4, True),
+        (2, 5, True),
+        (5, 6, True),
+    ),
+    services=(
+        ((0, 1, 2, 3, 4), 4, 600.0, 0.0),
+        ((4, 3, 2, 1, 0), 4, 600.0, 0.0),
+        ((0, 1, 2, 5, 6), 4, 600.0, 300.0),
+        ((6, 5, 2, 1, 0), 4, 600.0, 300.0),
+    ),
+)
+PRESETS["branch"] = replace(PRESETS["line"], n_stations=7, network=BRANCH)
+# The branch network with the blockage process of `blockage`.
+PRESETS["branch_outage"] = replace(PRESETS["branch"], disruption=PRESETS["blockage"].disruption)
 
 
 class Infra(NamedTuple):
@@ -177,10 +265,32 @@ class Infra(NamedTuple):
     # position instead (-1 if none), and its nominal running seconds there.
     alt_route: np.ndarray
     alt_run: np.ndarray
+    # (trains, L) int: the train's heading at each route position (0/1; see
+    # `Network`; on a line, its direction). "Going the other way" in a
+    # shared section means a different heading there.
+    heading: np.ndarray
+    # (trains, L + 1): at route index pos + 1, the heading on entering
+    # `next_section` (0 if none).
+    next_heading: np.ndarray
 
 
 def build(config: TrainConfig) -> Infra:
-    c = config
+    if config.network is not None:
+        return _build_network(config)
+    return _build_line(config)
+
+
+def _timetable(c, steps, depart):
+    """Scheduled entry seconds per step from `depart`, and the arrival."""
+    sched, t = [], depart
+    for _, seconds, stop, *_ in steps:
+        sched.append(t)
+        dwell = math.ceil(c.dwell_seconds / c.step_seconds) if stop else 0
+        t += (math.ceil(seconds / c.step_seconds) + dwell) * c.step_seconds * (1 + c.slack)
+    return sched, t
+
+
+def _build_line(c: TrainConfig) -> Infra:
     n_st, k = c.n_stations, c.blocks_per_section
     blocks = []  # (kind, station or section, detail) per block id
 
@@ -261,41 +371,162 @@ def build(config: TrainConfig) -> Infra:
         sched[i, len(steps)] = t
     direction = np.array([d for d, _, _ in trains])
     express = np.array([e for _, e, _ in trains])
+    heading = np.repeat(direction[:, None], L, axis=1)
+    loop_platform = np.zeros(n_blocks, bool)
+    loop_platform[[b for row in loop for b in row if b >= 0]] = True
+    return _derive(
+        c,
+        station_of,
+        section_of,
+        route,
+        np.full(T, L),
+        run,
+        dwell,
+        sched,
+        direction,
+        express,
+        loop_platform,
+        alt_route,
+        alt_run,
+        heading,
+    )
+
+
+def _build_network(c: TrainConfig) -> Infra:
+    net, k = c.network, c.blocks_per_section
+    kinds = []  # (kind, station or section) per block id
+
+    def add(kind, where):
+        kinds.append((kind, where))
+        return len(kinds) - 1
+
+    platform = [[add("station", s) for _ in range(2)] for s in range(net.n_stations)]
+    tracks, n_sections = {}, 0  # (u, v) with u < v -> [heading][j], j from u to v
+    for u, v, single in net.edges:
+        u, v = min(u, v), max(u, v)
+        if single:
+            shared = [add("section", n_sections) for _ in range(k)]
+            tracks[u, v] = [shared, shared]
+            n_sections += 1
+        else:
+            tracks[u, v] = [[add("section", n_sections + h) for _ in range(k)] for h in range(2)]
+            n_sections += 2
+    station_of = np.array([w if kind == "station" else -1 for kind, w in kinds])
+    section_of = np.array([w if kind == "section" else -1 for kind, w in kinds])
+
+    trains = []  # (departure, service, steps)
+    for n_service, (path, n, headway, offset) in enumerate(net.services):
+        steps = []  # (block, seconds, stop, heading)
+        for pos, s in enumerate(path):
+            if pos + 1 < len(path):
+                h = 0 if path[pos + 1] > s else 1
+            else:
+                h = 0 if s > path[pos - 1] else 1
+            steps.append((platform[s][h], c.platform_seconds, True, h))
+            if pos + 1 < len(path):
+                nxt = path[pos + 1]
+                sec = tracks[min(s, nxt), max(s, nxt)][h]
+                order = sec if h == 0 else sec[::-1]
+                steps += [(b, c.section_block_seconds, False, h) for b in order]
+        for m in range(n):
+            trains.append((offset + m * headway, n_service, steps))
+    trains.sort(key=lambda tr: (tr[0], tr[1]))  # index order is departure order
+
+    T, L = len(trains), max(len(steps) for *_, steps in trains)
+    route = np.full((T, L), -1, np.int64)
+    run = np.zeros((T, L))
+    dwell = np.zeros((T, L), np.int64)
+    sched = np.zeros((T, L + 1))
+    heading = np.zeros((T, L), np.int64)
+    route_len = np.zeros(T, np.int64)
+    stop_ticks = math.ceil(c.dwell_seconds / c.step_seconds)
+    for i, (depart, _, steps) in enumerate(trains):
+        n = route_len[i] = len(steps)
+        times, arrival = _timetable(c, steps, depart)
+        for p, (block, seconds, stop, h) in enumerate(steps):
+            route[i, p], run[i, p], heading[i, p] = block, seconds, h
+            dwell[i, p] = stop_ticks if stop else 0
+            sched[i, p] = times[p]
+        sched[i, n] = arrival
+    direction = heading[:, 0].copy()  # a label for the observation: the first heading
+    return _derive(
+        c,
+        station_of,
+        section_of,
+        route,
+        route_len,
+        run,
+        dwell,
+        sched,
+        direction,
+        np.zeros(T, bool),
+        np.zeros(len(kinds), bool),
+        np.full((T, L), -1, np.int64),
+        np.zeros((T, L)),
+        heading,
+    )
+
+
+def _derive(
+    c,
+    station_of,
+    section_of,
+    route,
+    route_len,
+    run,
+    dwell,
+    sched,
+    direction,
+    express,
+    loop_platform,
+    alt_route,
+    alt_run,
+    heading,
+) -> Infra:
+    """The lookup tables every builder shares, each stopping at the train's
+    route length (routes are padded with -1 beyond it)."""
+    T, L = route.shape
+    n_blocks = len(station_of)
     next_section = np.full((T, L + 1), -1, np.int64)
+    next_heading = np.zeros((T, L + 1), np.int64)
     for i in range(T):
-        for pos in range(-1, L):
+        n = int(route_len[i])
+        for pos in range(-1, n):
             here = section_of[route[i, pos]] if pos >= 0 else -1
-            for p in range(pos + 1, L):
+            for p in range(pos + 1, n):
                 sec = section_of[route[i, p]]
                 if sec >= 0 and sec != here:
                     next_section[i, pos + 1] = sec
+                    next_heading[i, pos + 1] = heading[i, p]
                     break
     far_platform = np.full((T, L + 1), -1, np.int64)
     for i in range(T):
-        for q in range(L):
-            for p in range(q + 1, L):
+        n = int(route_len[i])
+        for q in range(n):
+            for p in range(q + 1, n):
                 if station_of[route[i, p]] >= 0:
                     far_platform[i, q] = route[i, p]
                     break
     n_sections = int(section_of.max()) + 1
     used = np.zeros((n_sections, 2), bool)
     for i in range(T):
-        for r in (route[i], alt_route[i][alt_route[i] >= 0]):
-            secs = section_of[r]
-            used[secs[secs >= 0], direction[i]] = True
+        n = int(route_len[i])
+        for table in (route[i, :n], alt_route[i, :n]):
+            for p, b in enumerate(table):
+                if b >= 0 and section_of[b] >= 0:
+                    used[section_of[b], heading[i, p]] = True
     section_shared = used.all(axis=1)
     calls = np.concatenate([dwell > 0, np.zeros((T, 1), bool)], axis=1)
     calls_from = np.cumsum(calls[:, ::-1], axis=1)[:, ::-1]
     nominal = np.maximum(1, np.ceil(run / c.step_seconds - 1e-9)).astype(np.int64) + dwell
+    nominal = np.where(np.arange(L)[None, :] < route_len[:, None], nominal, 0)
     cum_ticks = np.concatenate([np.zeros((T, 1), np.int64), np.cumsum(nominal, axis=1)], axis=1)
-    loop_platform = np.zeros(n_blocks, bool)
-    loop_platform[[b for row in loop for b in row if b >= 0]] = True
     return Infra(
         n_blocks,
         station_of,
         section_of,
         route,
-        np.full(T, L),
+        np.asarray(route_len, np.int64),
         run,
         dwell,
         sched,
@@ -309,4 +540,6 @@ def build(config: TrainConfig) -> Infra:
         loop_platform,
         alt_route,
         alt_run,
+        heading,
+        next_heading,
     )

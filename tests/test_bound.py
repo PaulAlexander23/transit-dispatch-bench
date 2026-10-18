@@ -24,9 +24,12 @@ def test_a_calm_timetable_has_a_zero_bound():
     assert solve(env, scenario(env, jax.random.key(0))).cost == pytest.approx(0.0, abs=1e-6)
 
 
-@pytest.mark.parametrize("preset", ["single", "blockage", "junction"])
+@pytest.mark.parametrize("preset", ["single", "blockage", "junction", "branch", "mixed"])
 def test_the_bound_is_below_every_finished_episode(preset):
-    env = TrainEnv(preset, max_steps=720)  # long enough for everyone to finish
+    from test_train import MIXED
+
+    config = MIXED if preset == "mixed" else preset
+    env = TrainEnv(config, max_steps=720)  # long enough for everyone to finish
     episode = jax.jit(lambda k, policy: run(env, policy, k), static_argnums=1)
     gaps = []
     for seed in range(6):
@@ -35,7 +38,7 @@ def test_the_bound_is_below_every_finished_episode(preset):
         assert bound.optimal
         for policy in (env.heuristic(), FirstComeFirstServed(env)):
             cost, finished = episode(key, policy)
-            if finished:
-                assert bound.cost <= float(cost) + 1e-6
+            if finished:  # the episode's cost is float32: allow for its rounding
+                assert bound.cost <= float(cost) + 1e-4
                 gaps.append(float(cost) - bound.cost)
-    assert gaps and min(gaps) >= -1e-6
+    assert gaps and min(gaps) >= -1e-4

@@ -224,6 +224,15 @@ class TrainSim:
             back = arrive + dwell + road * abs(s - c.depot)
         return cost, back
 
+    def heading_now(self, j):
+        """The heading of train j in the block it holds (see `infra.Network`)."""
+        return int(self.infra.heading[j][self.pos[j]])
+
+    def entry_heading(self, i):
+        """The heading train i would enter its next block with."""
+        L = self.infra.heading.shape[1]
+        return int(self.infra.heading[i][min(self.pos[i] + 1, L - 1)])
+
     def here(self, i):
         """The block train i holds, or -1."""
         if self.pos[i] == NOT_STARTED or self.finished(i):
@@ -421,13 +430,14 @@ class TrainSim:
                 float(self.can_bridge(i)),
                 self._bridge_field(i),
             ]
-            sec, d = target[i], infra.direction[i]
+            sec = target[i]
+            d = int(infra.next_heading[i][self.pos[i] + 1]) if sec >= 0 else 0
             inside = sec >= 0 and any(
-                j >= 0 and infra.section_of[blk] == sec and infra.direction[j] != d
+                j >= 0 and infra.section_of[blk] == sec and self.heading_now(j) != d
                 for blk, j in enumerate(self.occupant)
             )
             rivals = [
-                j for j in range(T) if sec >= 0 and joining[j] == sec and infra.direction[j] != d
+                j for j in range(T) if sec >= 0 and joining[j] == sec and self.entry_heading(j) != d
             ]
             b = self.next_block(i) if not self.finished(i) else -1
             now_entering = sec >= 0 and b >= 0 and infra.section_of[b] == sec
@@ -439,7 +449,7 @@ class TrainSim:
                 if p < n:
                     b = self.block_at(i, p)
                     j = self.occupant[b]
-                    same = j >= 0 and infra.direction[j] == infra.direction[i]
+                    same = j >= 0 and self.heading_now(j) == infra.heading[i][p]
                     ahead += [1.0, float(j >= 0), float(same), float(self.block_open[b])]
                     ahead += self._outage(b)
                 else:
@@ -507,7 +517,7 @@ def section_reservation(sim):
     """First come, first served, but never into a section against the flow.
 
     A train may enter a section (the blocks between two stations) only if
-    no train going the other way is in it, or about to enter it this tick
+    no train going the other way (with the other heading) is in it, or about to enter it this tick
     ahead of this one in the acting order. On a single-track line this
     rules out the head-on deadlock that first come, first served walks into
     (two trains entering a section from both ends). Deadlocks spanning
@@ -515,7 +525,7 @@ def section_reservation(sim):
     """
     infra = sim.infra
     actions = []
-    entering = {}  # section -> directions entering it this tick, so far in order
+    entering = {}  # section -> headings entering it this tick, so far in order
     for i in range(len(sim.pos)):
         b = sim.next_block(i)
         if not sim.deciding(i) or infra.section_of[b] < 0:
@@ -526,9 +536,9 @@ def section_reservation(sim):
         if here >= 0 and infra.section_of[here] == section:
             actions.append(GO)  # already inside: carry on
             continue
-        d = infra.direction[i]
+        d = sim.entry_heading(i)
         against = any(
-            j >= 0 and infra.section_of[blk] == section and infra.direction[j] != d
+            j >= 0 and infra.section_of[blk] == section and sim.heading_now(j) != d
             for blk, j in enumerate(sim.occupant)
         )
         against |= any(other != d for other in entering.get(section, []))
@@ -589,7 +599,7 @@ def reroute(sim, rule=route_setting):
     """
     actions = list(rule(sim))
     infra = sim.infra
-    entering = {}  # relief section -> directions diverting into it this tick, so far
+    entering = {}  # relief section -> headings diverting into it this tick, so far
     for i in range(len(sim.pos)):
         a = sim.alt_block(i)
         if a < 0 or not sim.deciding(i):
@@ -602,9 +612,9 @@ def reroute(sim, rule=route_setting):
         )
         if actions[i] == GO and main_ok:
             continue
-        section, d = int(infra.section_of[a]), infra.direction[i]
+        section, d = int(infra.section_of[a]), sim.entry_heading(i)
         against = any(
-            j >= 0 and infra.section_of[blk] == section and infra.direction[j] != d
+            j >= 0 and infra.section_of[blk] == section and sim.heading_now(j) != d
             for blk, j in enumerate(sim.occupant)
         )
         against |= any(other != d for other in entering.get(section, []))

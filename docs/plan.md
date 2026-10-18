@@ -942,6 +942,76 @@ is a loop of 8 stops with 4 buses, at about the train's 10-minute headway.
     differences in passenger-minutes are the meaningful comparison here;
     the harness reports rail and bus costs separately for that reason.
 
+### Phase 8: general rail networks
+
+The train env on any network of stations and sections, not just a line.
+This opens the backlog's random-network generalisation, and makes the
+waterway and taxiing applications into presets (applications.md).
+
+- [x] **Networks as config.** A `Network` gives the stations, the edges
+      (single or double track) and the services (a station path, a
+      number of trains, a headway and an offset). `infra.build` builds
+      platforms, blocks, routes and the timetable from it. The line
+      builder stays, so the line presets are unchanged.
+- [x] **Heading instead of direction.** The conflict logic asks "is a
+      train going the other way in this shared section?". On a line,
+      "the other way" is east against west. On a network it is the
+      direction each train traverses that section. A per-position
+      `heading` table replaces `direction` in the section rules, the
+      section observation fields and the "same direction" lookahead
+      field. On a line, heading equals direction, so the line presets
+      must give the same returns as before (checked against the results
+      table).
+- [x] **Variable route lengths.** Services have different lengths. The
+      derived tables and the hindsight bound stop at each train's route
+      length instead of the padded width.
+- [x] **Presets.** `branch`: a double-track trunk splitting at a junction
+      into two single-track branches, one service per branch. Trains
+      merge at the junction and cross on the branches. `branch_outage`
+      adds the blockage process. Rules, bound and harness rows for both.
+- Deferred: relief tracks, passing loops and expresses on networks;
+  networks drawn at random per episode (the infrastructure becomes part
+  of the state rather than constants); route choice between paths.
+
+**Result.** The train env runs on any network given as a `Network`. Its
+step logic needed no change beyond headings: everything else already
+worked on routes over blocks.
+
+- **Line presets unchanged.** The line builder produces the same arrays as
+  before, and all 40 train and corridor baselines return bit-identical
+  means (64 episodes each). On a line, heading equals direction.
+- **Parity.** JAX matches Python step for step on `branch`,
+  `branch_outage` and a test network (`MIXED` in tests/test_train.py).
+  The test network has a spur, both kinds of track, routes of two
+  lengths, blockages and TERMINATE. The hindsight bound handles routes of
+  different lengths, and stays below every finished episode there too.
+- **Results** (bound: `scripts/bound_eval.py`, 100 scenarios; harness:
+  512 episodes; minutes per train):
+
+  | Preset | Bound | Section reservation | Route setting (the heuristic) | Route setting above bound | Section reservation deadlocks |
+  |---|---|---|---|---|---|
+  | `branch` | 1.06 | 1.16 | 1.38 | **23%** | 1.4% of episodes |
+  | `branch_outage` | 2.34 | 2.70 | 3.17 | **26%** | 8.2% |
+
+  (Each rule's delay is over the episodes it finished: route setting 98%
+  and 95%, section reservation 97% and 91%. The bound column is over
+  route setting's episodes. On `branch_outage`, 5% of solves hit the 20 s
+  limit and report the dual bound, which is still valid.)
+- **What was learned.**
+  - The network gives the rules their largest gap to the bound so far:
+    23–26%, against 8% on `single` and 12% on `blockage`. Alongside
+    `passing` (28%), this is where a learner or a better rule has room.
+  - Route setting is the only rule that never deadlocks, but it gives
+    away more delay than on the line. Section reservation is 0.1–0.5 min
+    per train faster on average, at the price of deadlocks. A probable
+    cause (not measured) is the junction station: it has one platform
+    per heading for both branches, and route setting holds a train
+    until the platform at the far end of a single-track section is free,
+    so trains from the two branches wait for each other there. Next
+    steps: a rule that reserves platforms more finely, and an
+    analysis of where the bound's schedules differ from route setting
+    (as `give way to express` came out of the `passing` schedules).
+
 ## Backlog
 
 - New cores from [applications.md](applications.md), in the recommended

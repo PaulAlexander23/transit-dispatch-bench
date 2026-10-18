@@ -11,15 +11,14 @@ from transit_bench.envs.train.sim import BRIDGE, DIVERT, GO, NOT_STARTED, TERMIN
 
 
 def section_occupancy(env, state):
-    """(sections + 1, 2) bool: [s, d] a train going direction d is in section
+    """(sections + 1, 2) bool: [s, h] a train with heading h is in section
     s (the last row is a sink for blocks outside sections)."""
     S = env.n_sections
     section_of = jnp.asarray(env.infra.section_of, jnp.int32)
-    direction = jnp.asarray(env.infra.direction, jnp.int32)
     holder = state.occupant
     in_section = (holder >= 0) & (section_of >= 0)
     rows = jnp.where(in_section, section_of, S)
-    cols = direction[jnp.maximum(holder, 0)]
+    cols = env.heading_now(state, jnp.maximum(holder, 0))
     return jnp.zeros((S + 1, 2), bool).at[rows, cols].max(in_section)
 
 
@@ -41,7 +40,7 @@ class SectionReservation:
 
     A deciding train about to enter a section (from outside it) waits if a
     train going the other way occupies the section, or enters it this tick
-    ahead of it in the acting order. The occupancy per section and direction
+    ahead of it in the acting order. The occupancy per section and heading
     is one vectorised reduction; the "ahead of it this tick" part depends on
     earlier trains' choices, so it is a loop over trains, unrolled when traced.
     """
@@ -57,7 +56,7 @@ class SectionReservation:
         infra = env.infra
         S = env.n_sections
         section_of = jnp.asarray(infra.section_of, jnp.int32)
-        direction = jnp.asarray(infra.direction, jnp.int32)
+        direction = env.entry_heading(state)
         occupied = section_occupancy(env, state)[:S]
         deciding = env.deciding(state)
         nxt = env.next_block(state)
@@ -123,7 +122,7 @@ class Reroute:
         env, infra = self.env, self.env.infra
         T, L = infra.route.shape
         section_of = jnp.asarray(infra.section_of, jnp.int32)
-        direction = jnp.asarray(infra.direction, jnp.int32)
+        direction = env.entry_heading(state)
         route = jnp.asarray(infra.route, jnp.int32)
         alt_route = jnp.asarray(infra.alt_route, jnp.int32)
         far_table = jnp.asarray(infra.far_platform, jnp.int32)
